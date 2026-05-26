@@ -2,10 +2,10 @@ import dataclasses
 import logging
 import re
 from typing import Protocol, runtime_checkable
-import jax
+
 import flax.traverse_util
 import numpy as np
-import jax.numpy as jnp
+
 import openpi.models.model as _model
 import openpi.shared.array_typing as at
 import openpi.shared.download as download
@@ -53,32 +53,6 @@ class CheckpointWeightLoader(WeightLoader):
         # Add all missing LoRA weights.
         return _merge_params(loaded_params, params, missing_regex=".*lora.*")
 
-@dataclasses.dataclass(frozen=True)
-class ACOTCheckpointWeightLoader(WeightLoader):
-    params_path: str
-
-    def load(self, params: at.Params) -> at.Params:
-        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
-        key_mapping = {
-            "action_in_proj": "coarse_action_in_proj",
-            "action_out_proj": "coarse_action_out_proj",
-
-            "time_mlp_in": "coarse_time_mlp_in",
-            "time_mlp_out": "coarse_time_mlp_out",
-
-            "action_time_mlp_in": "coarse_action_time_mlp_in",
-            "action_time_mlp_out": "coarse_action_time_mlp_out",
-        }
-
-        keys_to_check = list(key_mapping.keys())
-        # Specially, we use pre-trained weight to initialize coarse&explicit action reasoner to stablize training
-        for source_key in keys_to_check:
-            if source_key in loaded_params:
-                target_key = key_mapping[source_key]
-                loaded_params[target_key] = loaded_params[source_key]
-                print(f"[INFO] Re-mapped pretrained weight '{source_key}' -> '{target_key}' (for Reasoner)")
-                
-        return _merge_params(loaded_params, params, missing_regex=".*")
 
 @dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
@@ -99,62 +73,32 @@ class PaliGemmaWeightLoader(WeightLoader):
         return _merge_params(loaded_params, params, missing_regex=".*")
 
 
-def _align_param(expected, loaded, init_method):
-    if expected.shape == loaded.shape:
-        return loaded.astype(expected.dtype)
+def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str) -> at.Params:
+    """Merges the loaded parameters with the reference parameters.
 
-    min_shape = tuple(min(e, l) for e, l in zip(expected.shape, loaded.shape))
-    slices = tuple(slice(0, m) for m in min_shape)
+    Args:
+        loaded_params: The parameters to merge.
+        params: The reference parameters.
+        missing_regex: A regex pattern for all missing keys that should be merged from the reference parameters.
 
-    if init_method == "zeros":
-        new_param = jnp.zeros(expected.shape, dtype=expected.dtype)
-    elif init_method == "random":
-        new_param = jax.random.normal(jax.random.PRNGKey(0), expected.shape, dtype=expected.dtype) * 0.02
-    else:
-        raise ValueError(f"Unknown init method: {init_method}")
+    Returns:
+        A new dictionary with the merged parameters.
+    """
+    flat_ref = flax.traverse_util.flatten_dict(params, sep="/")
+    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep="/")
 
-    new_param = new_param.at[slices].set(loaded[slices])
-    print(f"[WARN] Shape mismatch: expected {expected.shape}, got {loaded.shape}, truncated to {min_shape}")
-    return new_param
-
-def _merge_params(loaded_params: at.Params, params: at.Params, *, missing_regex: str, init="random") -> at.Params:
-
-    flat_ref = flax.traverse_util.flatten_dict(params, sep=None)
-    flat_loaded = flax.traverse_util.flatten_dict(loaded_params, sep=None)
-
+    # First, take all weights that are a subset of the reference weights.
     result = {}
     for k, v in flat_loaded.items():
         if k in flat_ref:
-            result[k] = _align_param(flat_ref[k], v, init)
+            result[k] = v.astype(flat_ref[k].dtype) if v.dtype != flat_ref[k].dtype else v
 
+    flat_loaded.clear()
+
+    # Then, merge any missing weights as defined by the missing regex.
     pattern = re.compile(missing_regex)
+    for k in {k for k in flat_ref if pattern.fullmatch(k)}:
+        if k not in result:
+            result[k] = flat_ref[k]
 
-    missing_keys = {k for k in flat_ref if pattern.fullmatch("/".join(map(str, k))) and k not in result}
-    
-    for k in missing_keys:
-        key_path = "/".join(map(str, k))
-        expected_param = flat_ref[k]
-
-        cloned = False
-        cloned_path_source = re.sub(r'(\w+)\_(\d+)', r'\g<1>_1', key_path, count=1)
-        k_source = tuple(cloned_path_source.split('/'))
-
-        if cloned_path_source != key_path:
-            if k_source in flat_loaded:
-                loaded_param_source = flat_loaded[k_source]
-
-                if expected_param.shape == loaded_param_source.shape:
-                    result[k] = loaded_param_source.astype(expected_param.dtype)
-                    print(f"[INFO] Cloned missing param {key_path} from {cloned_path_source} {expected_param.shape}")
-                    cloned = True
-                else:
-                    print(f"[WARN] Clone attempt failed for {key_path}: source shape {loaded_param_source.shape} != target shape {expected_param.shape}")
-
-        if not cloned:
-            if init == "zeros":
-                result[k] = jnp.zeros(expected_param.shape, dtype=expected_param.dtype)
-            else:
-                result[k] = jax.random.normal(jax.random.PRNGKey(0), expected_param.shape, dtype=expected_param.dtype) * 0.02
-            print(f"[WARN] Missing param {key_path}, init as {init}, {expected_param.shape}")
-
-    return flax.traverse_util.unflatten_dict(result)
+    return flax.traverse_util.unflatten_dict(result, sep="/")

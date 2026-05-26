@@ -3,14 +3,10 @@ import dataclasses
 import functools
 import inspect
 import re
-from typing import Any, ParamSpec, TypeVar, Optional
+from typing import Any, ParamSpec, TypeVar
 
 import flax.nnx as nnx
 import jax
-import jax.numpy as jnp
-import matplotlib.pyplot as plt
-import numpy as np
-import os
 
 P = ParamSpec("P")
 R = TypeVar("R")

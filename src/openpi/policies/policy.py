@@ -3,13 +3,14 @@ import logging
 import pathlib
 import time
 from typing import Any, TypeAlias
-import copy
+
 import flax
 import flax.traverse_util
 import jax
 import jax.numpy as jnp
 import numpy as np
 from openpi_client import base_policy as _base_policy
+import torch
 from typing_extensions import override
 
 from openpi import transforms as _transforms
@@ -30,63 +31,78 @@ class Policy(BasePolicy):
         output_transforms: Sequence[_transforms.DataTransformFn] = (),
         sample_kwargs: dict[str, Any] | None = None,
         metadata: dict[str, Any] | None = None,
+        pytorch_device: str = "cpu",
+        is_pytorch: bool = False,
     ):
-        self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+        """Initialize the Policy.
+
+        Args:
+            model: The model to use for action sampling.
+            rng: Random number generator key for JAX models. Ignored for PyTorch models.
+            transforms: Input data transformations to apply before inference.
+            output_transforms: Output data transformations to apply after inference.
+            sample_kwargs: Additional keyword arguments to pass to model.sample_actions.
+            metadata: Additional metadata to store with the policy.
+            pytorch_device: Device to use for PyTorch models (e.g., "cpu", "cuda:0").
+                          Only relevant when is_pytorch=True.
+            is_pytorch: Whether the model is a PyTorch model. If False, assumes JAX model.
+        """
+        self._model = model
         self._input_transform = _transforms.compose(transforms)
         self._output_transform = _transforms.compose(output_transforms)
-        self._rng = rng or jax.random.key(0)
         self._sample_kwargs = sample_kwargs or {}
         self._metadata = metadata or {}
+        self._is_pytorch_model = is_pytorch
+        self._pytorch_device = pytorch_device
+
+        if self._is_pytorch_model:
+            self._model = self._model.to(pytorch_device)
+            self._model.eval()
+            self._sample_actions = model.sample_actions
+        else:
+            # JAX model setup
+            self._sample_actions = nnx_utils.module_jit(model.sample_actions)
+            self._rng = rng or jax.random.key(0)
 
     @override
-    def infer(self, obs: dict) -> dict:  # type: ignore[misc]
+    def infer(self, obs: dict, *, noise: np.ndarray | None = None) -> dict:  # type: ignore[misc]
         # Make a copy since transformations may modify the inputs in place.
         inputs = jax.tree.map(lambda x: x, obs)
         inputs = self._input_transform(inputs)
-        # Make a batch and convert to jax.Array.
-        inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
-
-        start_time = time.monotonic()
-        self._rng, sample_rng = jax.random.split(self._rng)         
-        outputs = {
-            "state": inputs["state"]
-        }
-        result = self._sample_actions(sample_rng, _model.Observation.from_dict(inputs), **self._sample_kwargs)
-
-        if isinstance(result, dict):
-            outputs.update(result)    
+        if not self._is_pytorch_model:
+            # Make a batch and convert to jax.Array.
+            inputs = jax.tree.map(lambda x: jnp.asarray(x)[np.newaxis, ...], inputs)
+            self._rng, sample_rng_or_pytorch_device = jax.random.split(self._rng)
         else:
-            outputs["actions"] = result
-        # outputs["actions"] = inputs["actions"]
+            # Convert inputs to PyTorch tensors and move to correct device
+            inputs = jax.tree.map(lambda x: torch.from_numpy(np.array(x)).to(self._pytorch_device)[None, ...], inputs)
+            sample_rng_or_pytorch_device = self._pytorch_device
 
-        # Unbatch and convert to np.ndarray.
-        outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
+        # Prepare kwargs for sample_actions
+        sample_kwargs = dict(self._sample_kwargs)
+        if noise is not None:
+            noise = torch.from_numpy(noise).to(self._pytorch_device) if self._is_pytorch_model else jnp.asarray(noise)
+
+            if noise.ndim == 2:  # If noise is (action_horizon, action_dim), add batch dimension
+                noise = noise[None, ...]  # Make it (1, action_horizon, action_dim)
+            sample_kwargs["noise"] = noise
+
+        observation = _model.Observation.from_dict(inputs)
+        start_time = time.monotonic()
+        outputs = {
+            "state": inputs["state"],
+            "actions": self._sample_actions(sample_rng_or_pytorch_device, observation, **sample_kwargs),
+        }
         model_time = time.monotonic() - start_time
+        if self._is_pytorch_model:
+            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...].detach().cpu()), outputs)
+        else:
+            outputs = jax.tree.map(lambda x: np.asarray(x[0, ...]), outputs)
 
         outputs = self._output_transform(outputs)
         outputs["policy_timing"] = {
             "infer_ms": model_time * 1000,
         }
-        return self.post_process(obs, outputs)
-
-    def post_process(self, obs: dict, outputs: dict) -> dict:
-        task_name_requiring_waist = ["sorting_packages", "sorting_packages_continuous"]
-        task_name = jax.tree.map(lambda x: x, obs).get("task_name", None)
-
-        if task_name is None:
-            return outputs
-
-        print(f"Policy infering for task: {task_name}, with inference time: {outputs['policy_timing']['infer_ms']:.3f} ms")
-        if task_name not in task_name_requiring_waist:
-            # cut off waist actions for tasks that don't require it
-            outputs["actions"] = outputs["actions"][:, :16]
-
-        else:
-            raw_state = jax.tree.map(lambda x: x, obs).get("state", None)
-            assert raw_state is not None, "State is required for post-processing waist actions"
-            # freeze four waist actions to the current state, utilizing only the last action for policy output
-            outputs["actions"][:, 16:20] = raw_state[16:20]
-
         return outputs
 
     @property

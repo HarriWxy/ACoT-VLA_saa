@@ -45,7 +45,7 @@ def initialize_checkpoint_dir(
             "params": ocp.PyTreeCheckpointHandler(),
         },
         options=ocp.CheckpointManagerOptions(
-            max_to_keep=None,
+            max_to_keep=1,
             keep_period=keep_period,
             create=False,
             async_options=ocp.AsyncOptions(timeout_secs=7200),
@@ -68,18 +68,12 @@ def save_state(
     data_loader: _data_loader.DataLoader,
     step: int,
 ):
-    asset_dir = checkpoint_manager.directory / f"{step}" / "assets"
-    def save_assets(directory: epath.Path = asset_dir):
+    def save_assets(directory: epath.Path):
         # Save the normalization stats.
         data_config = data_loader.data_config()
         norm_stats = data_config.norm_stats
         if norm_stats is not None and data_config.asset_id is not None:
-            _normalize.save(directory, norm_stats)
-            # if isinstance(data_config.asset_id, list):
-            #     _normalize.save(directory, norm_stats)
-            # else:
-            #     # original, which cannot be used here since asset_ids now is an absolute path 
-            #     _normalize.save(directory / data_config.asset_id, norm_stats)
+            _normalize.save(directory / data_config.asset_id, norm_stats)
 
     # Split params that can be used for inference into a separate item.
     with at.disable_typechecking():
@@ -114,10 +108,7 @@ def restore_state(
 
 
 def load_norm_stats(assets_dir: epath.Path | str, asset_id: str) -> dict[str, _normalize.NormStats] | None:
-    if "/" in asset_id or isinstance(asset_id, list):
-        norm_stats_dir = epath.Path(assets_dir)
-    else:
-        norm_stats_dir = epath.Path(assets_dir) / asset_id
+    norm_stats_dir = epath.Path(assets_dir) / asset_id
     norm_stats = _normalize.load(norm_stats_dir)
     logging.info(f"Loaded norm stats from {norm_stats_dir}")
     return norm_stats

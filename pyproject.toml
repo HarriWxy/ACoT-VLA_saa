@@ -3,7 +3,7 @@ name = "openpi"
 version = "0.1.0"
 description = "Open source repo"
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { file = "LICENSE" }
 dependencies = [
     "augmax>=0.3.4",
@@ -19,14 +19,14 @@ dependencies = [
     "jaxtyping==0.2.36",
     "lerobot",
     "ml_collections==1.0.0",
-    "numpy>=1.22.4,<2.0.0",
+    "numpy",
     "numpydantic>=1.6.6",
     "opencv-python>=4.10.0.84",
     "openpi-client",
     "orbax-checkpoint==0.11.13",
     "pillow>=11.0.0",
     "sentencepiece>=0.2.0",
-    "torch>=2.7.0",
+    "torch==2.11.0",
     "tqdm-loggable>=0.2",
     "typing-extensions>=4.12.2",
     "tyro>=0.9.5",
@@ -37,6 +37,10 @@ dependencies = [
     "transformers==4.48.1",
     "rich>=14.0.0",
     "polars>=1.30.0",
+    "mujoco>=3.6.0",
+    "evdev>=1.9.3",
+    "chex==0.1.90",
+    "nvidia-ml-py",
 ]
 
 
@@ -51,28 +55,42 @@ dev = [
     "ipykernel>=6.29.5",
     "ipywidgets>=8.1.5",
     "matplotlib>=3.10.0",
-    "pynvml>=12.0.0",
+
 ]
 rlds = [
-    "dlimp",
-    "tensorflow-cpu==2.15.0",
-    "tensorflow-datasets==4.9.9",
+    "dlimp==0.0.1.1",
+    "tensorflow",
+    "tensorflow-datasets",
 ]
 
 [tool.uv]
 override-dependencies = ["ml-dtypes==0.4.1", "tensorstore==0.1.74"]
 
+[[tool.uv.index]]
+name = "pypi"
+url = "https://mirrors.aliyun.com/pypi/simple/"
+default = true
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
+
+
 [tool.uv.sources]
 openpi-client = { workspace = true }
 lerobot = { git = "https://github.com/huggingface/lerobot", rev = "0cf864870cf29f4738d3ade893e6fd13fbd7cdb5" }
-dlimp = { git = "https://github.com/kvablack/dlimp", rev = "ad72ce3a9b414db2185bc0b38461d4101a65477a" }
+dlimp = { git = "https://github.com/HarriWxy/dlimp.git"}
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+
 
 [tool.uv.workspace]
 members = ["packages/*"]
 
 [tool.ruff]
 line-length = 120
-target-version = "py311"
+target-version = "py312"
 extend-exclude = ["docker", "third_party"]
 
 [tool.ruff.lint]

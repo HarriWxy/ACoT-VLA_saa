@@ -2,12 +2,10 @@ from collections.abc import Callable, Mapping, Sequence
 import dataclasses
 import re
 from typing import Protocol, TypeAlias, TypeVar, runtime_checkable
-import torch
+
 import flax.traverse_util as traverse_util
 import jax
 import numpy as np
-from PIL import Image
-import torchvision
 from openpi_client import image_tools
 
 from openpi.models import tokenizer as _tokenizer
@@ -166,7 +164,7 @@ class Unnormalize(DataTransformFn):
             data,
             self.norm_stats,
             self._unnormalize_quantile if self.use_quantiles else self._unnormalize,
-            strict=False,
+            strict=True,
         )
 
     def _unnormalize(self, x, stats: NormStats):
@@ -187,20 +185,11 @@ class Unnormalize(DataTransformFn):
 class ResizeImages(DataTransformFn):
     height: int
     width: int
-    key: str = "image"
-
-    def to_numpy(self, array_like):
-        if hasattr(array_like, "cpu"):
-            return array_like.detach().cpu().numpy()
-
-        if hasattr(array_like, "__array__"):
-            return np.array(array_like)
-
-        return array_like
 
     def __call__(self, data: DataDict) -> DataDict:
-        data[self.key] = {k: image_tools.resize_with_pad(self.to_numpy(v), self.height, self.width) for k, v in data[self.key].items()}
+        data["image"] = {k: image_tools.resize_with_pad(v, self.height, self.width) for k, v in data["image"].items()}
         return data
+
 
 @dataclasses.dataclass(frozen=True)
 class SubsampleActions(DataTransformFn):
@@ -254,44 +243,6 @@ class AbsoluteActions(DataTransformFn):
 
         return data
 
-@dataclasses.dataclass(frozen=True)
-class ACOTDeltaActions(DataTransformFn):
-    """Repacks absolute actions into delta action space."""
-
-    mask: Sequence[bool] | None
-    use_delta_joint_actions: Sequence[bool]
-
-    def __call__(self, data: DataDict) -> DataDict:
-        keys = ["coarse_actions", "actions"]
-        state = data["state"]
-        mask = np.asarray(self.mask)
-        dims = mask.shape[-1]
-        for idx, key in enumerate(keys):
-            if self.use_delta_joint_actions[idx] and key in data:
-                actions = data[key]
-                actions[..., :dims] -= np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-                data[key] = actions
-        return data
-
-
-@dataclasses.dataclass(frozen=True)
-class ACOTAbsoluteActions(DataTransformFn):
-    """Repacks delta actions into absolute action space."""
-
-    mask: Sequence[bool] | None
-    use_delta_joint_actions: Sequence[bool]
-
-    def __call__(self, data: DataDict) -> DataDict:
-        keys = ["coarse_actions", "actions"]
-        state = data["state"]
-        mask = np.asarray(self.mask)
-        dims = mask.shape[-1]
-        for idx, key in enumerate(keys):
-            if self.use_delta_joint_actions[idx] and key in data:
-                actions = data[key]
-                actions[..., :dims] += np.expand_dims(np.where(mask, state[..., :dims], 0), axis=-2)
-                data[key] = actions
-        return data
 
 @dataclasses.dataclass(frozen=True)
 class TokenizePrompt(DataTransformFn):
@@ -301,7 +252,7 @@ class TokenizePrompt(DataTransformFn):
     def __call__(self, data: DataDict) -> DataDict:
         if (prompt := data.pop("prompt", None)) is None:
             raise ValueError("Prompt is required")
-        # print(f"Prompt: {prompt}")
+
         if self.discrete_state_input:
             if (state := data.get("state", None)) is None:
                 raise ValueError("State is required.")
@@ -372,34 +323,6 @@ class PromptFromLeRobotTask(DataTransformFn):
 
         return {**data, "prompt": prompt}
 
-@dataclasses.dataclass(frozen=True)
-class PromptFromHighlevelInstruction(DataTransformFn):
-    """Extracts a prompt from the current LeRobot dataset task."""
-
-    # Contains the LeRobot dataset tasks (dataset.meta.tasks).
-    instruction_segments: dict
-
-    def __call__(self, data: DataDict) -> DataDict:
-        if "episode_index" not in data:
-            raise ValueError('Cannot extract prompt without "task_index"')
-
-        episode_index = int(data["episode_index"])
-        frame_index = int(data["frame_index"])
-        segments = self.instruction_segments.get(str(episode_index))
-
-        segment_id = len(segments) - 1
-        segments[0]['start_frame_index'] = 0
-        for i, segment in enumerate(segments):
-            if frame_index >= segment['start_frame_index'] and frame_index < segment['end_frame_index']:
-                segment_id = i
-                break
-        
-        if segment_id is not None:
-            segment = segments[segment_id]
-            instruction = segment['instruction']
-        else:
-            raise ValueError(f"No segment found for episode {episode_index} and frame {frame_index}")
-        return {**data, "prompt": instruction}
 
 @dataclasses.dataclass(frozen=True)
 class PadStatesAndActions(DataTransformFn):
@@ -413,19 +336,6 @@ class PadStatesAndActions(DataTransformFn):
             data["actions"] = pad_to_dim(data["actions"], self.model_action_dim, axis=-1)
         return data
 
-@dataclasses.dataclass(frozen=True)
-class ACOTPadStatesAndActions(DataTransformFn):
-    """Zero-pads states and actions to the model action dimension."""
-
-    model_action_dim: int
-
-    def __call__(self, data: DataDict) -> DataDict:
-        data["state"] = pad_to_dim(data["state"], self.model_action_dim, axis=-1)
-        keys = ["coarse_actions", "actions"]
-        for key in keys:
-            if key in data:
-                data[key] = pad_to_dim(data[key], self.model_action_dim, axis=-1)
-        return data
 
 def flatten_dict(tree: at.PyTree) -> dict:
     """Flatten a nested dictionary. Uses '/' as the separator."""

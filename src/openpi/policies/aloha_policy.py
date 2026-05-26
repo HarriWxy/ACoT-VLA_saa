@@ -1,9 +1,9 @@
 import dataclasses
-from typing import ClassVar, Sequence
+from typing import ClassVar
 
 import einops
 import numpy as np
-import copy
+
 from openpi import transforms
 
 
@@ -86,84 +86,6 @@ class AlohaInputs(transforms.DataTransformFn):
 
         return inputs
 
-@dataclasses.dataclass(frozen=True)
-class AlohaACOTInputs(transforms.DataTransformFn):
-    """Inputs for the Aloha policy.
-
-    Expected inputs:
-    - images: dict[name, img] where img is [channel, height, width]. name must be in EXPECTED_CAMERAS.
-    - state: [14]
-    - actions: [action_horizon, 14]
-    """
-
-    # If true, this will convert the joint and gripper values from the standard Aloha space to
-    # the space used by the pi internal runtime which was used to train the base model.
-    adapt_to_pi: bool = True
-    acot_action_generation: Sequence[Sequence[int]] | None = None
-    # The expected cameras names. All input cameras must be in this set. Missing cameras will be
-    # replaced with black images and the corresponding `image_mask` will be set to False.
-    EXPECTED_CAMERAS: ClassVar[tuple[str, ...]] = ("cam_high", "cam_low", "cam_left_wrist", "cam_right_wrist")
-
-    def __call__(self, data: dict) -> dict:
-        data = _decode_aloha(data, adapt_to_pi=self.adapt_to_pi)
-
-        in_images = data["images"]
-        if set(in_images) - set(self.EXPECTED_CAMERAS):
-            raise ValueError(f"Expected images to contain {self.EXPECTED_CAMERAS}, got {tuple(in_images)}")
-
-        # Assume that base image always exists.
-        base_image = in_images["cam_high"]
-
-        images = {
-            "base_0_rgb": base_image,
-        }
-        image_masks = {
-            "base_0_rgb": np.True_,
-        }
-
-        # Add the extra images.
-        extra_image_names = {
-            "left_wrist_0_rgb": "cam_left_wrist",
-            "right_wrist_0_rgb": "cam_right_wrist",
-        }
-        for dest, source in extra_image_names.items():
-            if source in in_images:
-                images[dest] = in_images[source]
-                image_masks[dest] = np.True_
-            else:
-                images[dest] = np.zeros_like(base_image)
-                image_masks[dest] = np.False_
-
-        inputs = {
-            "image": images,
-            "image_mask": image_masks,
-            "state": data["state"],
-        }
-
-        if self.acot_action_generation is not None and "actions" in data:
-            action_horizons = self.acot_action_generation[0]
-            joint_action_shifts = self.acot_action_generation[1]
-
-            raw_data = data["actions"]
-            keys = ["coarse_actions", "actions"]
-            for idx, key in enumerate(keys):
-                action_horizon = action_horizons[idx]
-                joint_action_shift = joint_action_shifts[idx]
-                required_length = (action_horizon - 1) * joint_action_shift + 1
-                data[key] = copy.deepcopy(raw_data[:required_length:joint_action_shift])
-                assert len(data[key]) == action_horizon, f"Expected {action_horizon} actions, got {len(data[key])} for key {key}."
-        
-        for key in ['coarse_actions', 'actions']:
-            if key in data:
-                actions = np.asarray(data[key])
-                actions = _encode_actions_inv(actions, adapt_to_pi=self.adapt_to_pi)
-                inputs[key] = actions
-
-        if "prompt" in data:
-            inputs["prompt"] = data["prompt"]
-
-        return inputs
-
 
 @dataclasses.dataclass(frozen=True)
 class AlohaOutputs(transforms.DataTransformFn):
@@ -178,18 +100,6 @@ class AlohaOutputs(transforms.DataTransformFn):
         actions = np.asarray(data["actions"][:, :14])
         return {"actions": _encode_actions(actions, adapt_to_pi=self.adapt_to_pi)}
 
-@dataclasses.dataclass(frozen=True)
-class AlohaACOTOutputs(transforms.DataTransformFn):
-    """Outputs for the Aloha policy."""
-
-    # If true, this will convert the joint and gripper values from the standard Aloha space to
-    # the space used by the pi internal runtime which was used to train the base model.
-    adapt_to_pi: bool = True
-
-    def __call__(self, data: dict) -> dict:
-        # Only return the first 14 dims.
-        keys = ['coarse_actions', 'actions']
-        return {key: _encode_actions(np.asarray(data[key][:, :14]), adapt_to_pi=self.adapt_to_pi) for key in keys if key in data}
 
 def _joint_flip_mask() -> np.ndarray:
     """Used to convert between aloha and pi joint angles."""

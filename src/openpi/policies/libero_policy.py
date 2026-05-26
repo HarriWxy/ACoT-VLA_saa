@@ -1,8 +1,8 @@
 import dataclasses
-import copy
+
 import einops
 import numpy as np
-from collections.abc import Sequence
+
 from openpi import transforms
 from openpi.models import model as _model
 
@@ -98,62 +98,3 @@ class LiberoOutputs(transforms.DataTransformFn):
         # For Libero, we only return the first 7 actions (since the rest is padding).
         # For your own dataset, replace `7` with the action dimension of your dataset.
         return {"actions": np.asarray(data["actions"][:, :7])}
-
-@dataclasses.dataclass(frozen=True)
-class LiberoACOTInputs(transforms.DataTransformFn):
-
-    model_type: _model.ModelType
-    acot_action_generation: Sequence[Sequence[int]] | None = None
-    def __call__(self, data: dict) -> dict:
-
-        base_image = _parse_image(data["observation/image"])
-        wrist_image = _parse_image(data["observation/wrist_image"])
-
-        # Create inputs dict. Do not change the keys in the dict below.
-        inputs = {
-            "state": data["observation/state"],
-            "image": {
-                "base_0_rgb": base_image,
-                "left_wrist_0_rgb": wrist_image,
-                # Pad any non-existent images with zero-arrays of the appropriate shape.
-                "right_wrist_0_rgb": np.zeros_like(base_image),
-            },
-            "image_mask": {
-                "base_0_rgb": np.True_,
-                "left_wrist_0_rgb": np.True_,
-                # We only mask padding images for pi0 model, not pi0-FAST. Do not change this for your own dataset.
-                "right_wrist_0_rgb": np.True_ if self.model_type == _model.ModelType.PI0_FAST else np.False_,
-            },
-        }
-
-        # Pad actions to the model action dimension. Keep this for your own dataset.
-        # Actions are only available during training.
-        if self.acot_action_generation is not None and "actions" in data:
-            action_horizons = self.acot_action_generation[0]
-            joint_action_shifts = self.acot_action_generation[1]
-
-            raw_data = data["actions"]
-            keys = ["coarse_actions", "actions"]
-            for idx, key in enumerate(keys):
-                action_horizon = action_horizons[idx]
-                joint_action_shift = joint_action_shifts[idx]
-                required_length = (action_horizon - 1) * joint_action_shift + 1
-                data[key] = copy.deepcopy(raw_data[:required_length:joint_action_shift])
-                assert len(data[key]) == action_horizon
-        
-        for key in ['coarse_actions', 'actions']:
-            if key in data:
-                inputs[key] = data[key]
-
-        if "prompt" in data:
-            inputs["prompt"] = data["prompt"]
-
-        return inputs
-
-
-@dataclasses.dataclass(frozen=True)
-class LiberoACOTOutputs(transforms.DataTransformFn):
-    def __call__(self, data: dict) -> dict:
-        keys = ['coarse_actions', 'actions']
-        ret_result = {key: np.asarray(data[key][:, :7]) for key in keys if key in data}
-        return ret_result

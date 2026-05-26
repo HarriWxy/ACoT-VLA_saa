@@ -52,7 +52,7 @@ class Config:
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
 
 
 def get_config(variant: Variant) -> Config:
@@ -66,59 +66,12 @@ def get_config(variant: Variant) -> Config:
             num_kv_heads=1,
             head_dim=16,
         )
-    if variant == "gemma_50m":
-        return Config(
-            width=128,
-            depth=18,
-            mlp_dim=1024,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
-        )
-    if variant == "gemma_150m":
-        # ~160M params
-        return Config(
-            width=768,
-            depth=18,
-            mlp_dim=3072,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
-        )
-    if variant == "gemma_250m":
-        return Config(
-            width=896,
-            depth=18,
-            mlp_dim=3584,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
-        )
     if variant == "gemma_300m":
         # 311M params
         return Config(
             width=1024,
             depth=18,
             mlp_dim=4096,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
-        )
-    if variant == "gemma_500m":
-        return Config(
-            width=1408,
-            depth=18,
-            mlp_dim=5632,
-            num_heads=8,
-            num_kv_heads=1,
-            head_dim=256,
-        )
-    if variant == "gemma_600m":
-        # 620M params
-        return Config(
-            width=1536,
-            depth=18,
-            mlp_dim=6144,
             num_heads=8,
             num_kv_heads=1,
             head_dim=256,
@@ -366,8 +319,8 @@ class Block(nn.Module):
                 x = lora.FeedForward(  # noqa: PLW2901
                     features=config.width,
                     hidden_dim=config.mlp_dim,
-                    lora_config=config.lora_configs.get("ffn"),
                     name=_name("mlp", i),
+                    lora_config=config.lora_configs.get("ffn"),
                 )(x)
             out.append(x)
             gates.append(gate if x is not None else None)

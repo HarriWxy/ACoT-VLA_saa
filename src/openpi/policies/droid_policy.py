@@ -64,7 +64,7 @@ class DroidInputs(transforms.DataTransformFn):
         }
 
         if "actions" in data:
-            inputs["actions"] = np.array(data["actions"])
+            inputs["actions"] = np.asarray(data["actions"])
 
         if "prompt" in data:
             if isinstance(data["prompt"], bytes):
