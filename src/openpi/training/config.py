@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.srb_policy as srb_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -350,6 +351,46 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
         return dataclasses.replace(
             self.create_base_config(assets_dirs, model_config),
             repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class SRBDataConfig(DataConfigFactory):
+    """Data config for Space Robotics Bench datasets stored in LeRobot format.
+
+    The expected dataset keys match the runtime observation dictionary used by the SRB
+    integration example: `proprio`, `state`, optional `state_dyn` / `proprio_dyn`,
+    optional `image_cam_base` / `image_cam_wrist`, and `actions`.
+    """
+
+    default_prompt: str | None = None
+    action_dim: int = 7
+    observation_keys: Sequence[str] = ("proprio", "state")
+    image_keys: Sequence[str] = ("image_cam_base", "image_cam_wrist")
+    strict_state_dim: bool = False
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default_factory=_transforms.Group)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                srb_policy.SRBInputs(
+                    action_dim=model_config.action_dim,
+                    model_type=model_config.model_type,
+                    observation_keys=self.observation_keys,
+                    image_keys=self.image_keys,
+                    strict_state_dim=self.strict_state_dim,
+                )
+            ],
+            outputs=[srb_policy.SRBOutputs(action_dim=self.action_dim)],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=self.repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
         )
@@ -929,6 +970,37 @@ _CONFIGS = [
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_base/params"),
         num_train_steps=20_000,
+    ),
+    #
+    # Space Robotics Bench configs.
+    #
+    TrainConfig(
+        name="pi05_srb",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False),
+        data=SRBDataConfig(
+            repo_id="your_hf_username/srb_manipulation",
+            base_config=DataConfig(prompt_from_task=True),
+            action_dim=7,
+            observation_keys=("proprio", "state"),
+            image_keys=("image_cam_base", "image_cam_wrist"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi0_fast_srb",
+        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=16, max_token_len=220),
+        data=SRBDataConfig(
+            repo_id="your_hf_username/srb_manipulation",
+            base_config=DataConfig(prompt_from_task=True),
+            action_dim=7,
+            observation_keys=("proprio", "state"),
+            image_keys=("image_cam_base", "image_cam_wrist"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
+        num_train_steps=30_000,
+        batch_size=64,
     ),
     #
     # Debugging configs.

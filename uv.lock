@@ -3169,6 +3169,7 @@ dependencies = [
     { name = "mujoco" },
     { name = "numpy" },
     { name = "numpydantic" },
+    { name = "nvidia-ml-py" },
     { name = "opencv-python" },
     { name = "openpi-client" },
     { name = "orbax-checkpoint" },
@@ -3191,7 +3192,6 @@ dev = [
     { name = "ipywidgets" },
     { name = "matplotlib" },
     { name = "pre-commit" },
-    { name = "pynvml" },
     { name = "pytest" },
     { name = "ruff" },
 ]
@@ -3223,6 +3223,7 @@ requires-dist = [
     { name = "mujoco", specifier = ">=3.6.0" },
     { name = "numpy" },
     { name = "numpydantic", specifier = ">=1.6.6" },
+    { name = "nvidia-ml-py" },
     { name = "opencv-python", specifier = ">=4.10.0.84" },
     { name = "openpi-client", editable = "packages/openpi-client" },
     { name = "orbax-checkpoint", specifier = "==0.11.13" },
@@ -3245,7 +3246,6 @@ dev = [
     { name = "ipywidgets", specifier = ">=8.1.5" },
     { name = "matplotlib", specifier = ">=3.10.0" },
     { name = "pre-commit", specifier = ">=4.0.1" },
-    { name = "pynvml", specifier = ">=12.0.0" },
     { name = "pytest", specifier = ">=8.3.4" },
     { name = "ruff", specifier = ">=0.8.6" },
 ]
@@ -4027,18 +4027,6 @@ dependencies = [
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/f0/c3/dccf44c68225046df5324db0cc7d563a560635355b3e5f1d249468268a6f/pynput-1.8.1.tar.gz", hash = "sha256:70d7c8373ee98911004a7c938742242840a5628c004573d84ba849d4601df81e" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/59/4f/ac3fa906ae8a375a536b12794128c5efacade9eaa917a35dfd27ce0c7400/pynput-1.8.1-py2.py3-none-any.whl", hash = "sha256:42dfcf27404459ca16ca889c8fb8ffe42a9fe54f722fd1a3e130728e59e768d2" },
-]
-
-[[package]]
-name = "pynvml"
-version = "13.0.1"
-source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
-dependencies = [
-    { name = "nvidia-ml-py" },
-]
-sdist = { url = "https://mirrors.aliyun.com/pypi/packages/5c/57/da7dc63a79f59e082e26a66ac02d87d69ea316b35b35b7a00d82f3ce3d2f/pynvml-13.0.1.tar.gz", hash = "sha256:1245991d9db786b4d2f277ce66869bd58f38ac654e38c9397d18f243c8f6e48f" }
-wheels = [
-    { url = "https://mirrors.aliyun.com/pypi/packages/d7/4a/cac76c174bb439a0c46c9a4413fcbea5c6cabfb01879f7bbdb9fdfaed76c/pynvml-13.0.1-py3-none-any.whl", hash = "sha256:e2b20e0a501eeec951e2455b7ab444759cf048e0e13a57b08049fa2775266aa8" },
 ]
 
 [[package]]
