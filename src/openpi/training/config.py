@@ -978,7 +978,7 @@ _CONFIGS = [
         name="pi05_srb",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False),
         data=SRBDataConfig(
-            repo_id="your_hf_username/srb_manipulation",
+            repo_id="ur5e",
             base_config=DataConfig(prompt_from_task=True),
             action_dim=7,
             observation_keys=("proprio", "state"),
@@ -992,7 +992,7 @@ _CONFIGS = [
         name="pi0_fast_srb",
         model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=16, max_token_len=220),
         data=SRBDataConfig(
-            repo_id="your_hf_username/srb_manipulation",
+            repo_id="ur5e",
             base_config=DataConfig(prompt_from_task=True),
             action_dim=7,
             observation_keys=("proprio", "state"),
