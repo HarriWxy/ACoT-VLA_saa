@@ -362,13 +362,13 @@ class SRBDataConfig(DataConfigFactory):
 
     The expected dataset keys match the runtime observation dictionary used by the SRB
     integration example: `proprio`, `state`, optional `state_dyn` / `proprio_dyn`,
-    optional `image_cam_base` / `image_cam_wrist`, and `actions`.
+    optional `image_base` / `image_wrist`, and `actions`.
     """
 
     default_prompt: str | None = None
-    action_dim: int = 7
-    observation_keys: Sequence[str] = ("proprio", "state")
-    image_keys: Sequence[str] = ("image_cam_base", "image_cam_wrist")
+    action_dim: int = 8
+    observation_keys: Sequence[str] = ("proprio",)
+    image_keys: Sequence[str] = ("image_base", "image_wrist")
     strict_state_dim: bool = False
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default_factory=_transforms.Group)
 
@@ -377,11 +377,11 @@ class SRBDataConfig(DataConfigFactory):
         data_transforms = _transforms.Group(
             inputs=[
                 srb_policy.SRBInputs(
-                    action_dim=model_config.action_dim,
-                    model_type=model_config.model_type,
-                    observation_keys=self.observation_keys,
-                    image_keys=self.image_keys,
-                    strict_state_dim=self.strict_state_dim,
+                    action_dim = self.action_dim,
+                    model_type = model_config.model_type,
+                    observation_keys = self.observation_keys,
+                    image_keys = self.image_keys,
+                    strict_state_dim = self.strict_state_dim,
                 )
             ],
             outputs=[srb_policy.SRBOutputs(action_dim=self.action_dim)],
@@ -980,9 +980,9 @@ _CONFIGS = [
         data=SRBDataConfig(
             repo_id="ur5e",
             base_config=DataConfig(prompt_from_task=True),
-            action_dim=7,
-            observation_keys=("proprio", "state"),
-            image_keys=("image_cam_base", "image_cam_wrist"),
+            action_dim=8,
+            observation_keys=("proprio",),
+            image_keys=("image_base", "image_wrist"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20_000,
@@ -990,13 +990,13 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="pi0_fast_srb",
-        model=pi0_fast.Pi0FASTConfig(action_dim=7, action_horizon=16, max_token_len=220),
+        model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=16, max_token_len=220),
         data=SRBDataConfig(
             repo_id="ur5e",
             base_config=DataConfig(prompt_from_task=True),
-            action_dim=7,
-            observation_keys=("proprio", "state"),
-            image_keys=("image_cam_base", "image_cam_wrist"),
+            action_dim=8,
+            observation_keys=("proprio",),
+            image_keys=("image_base", "image_wrist"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30_000,

@@ -11,8 +11,8 @@ def test_srb_inputs_flatten_and_pad_state():
         {
             "proprio": np.ones(9, dtype=np.float32),
             "state": np.arange(18, dtype=np.float32),
-            "image_cam_base": np.zeros((224, 224, 3), dtype=np.uint8),
-            "image_cam_wrist": np.ones((224, 224, 3), dtype=np.uint8),
+            "image_base": np.zeros((224, 224, 3), dtype=np.uint8),
+            "image_wrist": np.ones((224, 224, 3), dtype=np.uint8),
             "prompt": "pick up the sample",
         }
     )

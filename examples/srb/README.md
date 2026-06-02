@@ -6,7 +6,7 @@
 
 - `src/openpi/policies/srb_policy.py`
   - 把 SRB 的 flat observation dict 转成模型输入。
-  - 兼容 `state` / `proprio`，也兼容视觉任务里的 `image_cam_base` / `image_cam_wrist`。
+  - 兼容 `state` / `proprio`，也兼容视觉任务里的 `image_base` / `image_wrist`。
   - 如果当前 SRB 任务没有相机观测，会自动补零图像，所以非视觉任务也能跑通同一套接口。
 - `src/openpi/training/config.py`
   - 增加了 `SRBDataConfig`。
@@ -32,6 +32,17 @@ uv run python examples/srb/serve.py \
   --checkpoint-dir checkpoints/pi05_srb/<EXP_NAME>/<STEP>
 ```
 
+如果你只是想先验证 SRB 和 websocket 链路是否通，可以直接起随机或零动作后端，不需要 checkpoint：
+
+```bash
+uv run python examples/srb/serve.py \
+  --policy-mode random \
+  --action-dim 7 \
+  --action-horizon 16
+```
+
+`--policy-mode zero` 会返回全零动作，更适合先确认环境能稳定 step。`--random-action-scale` 默认是 `0.25`，可以按需调大或调小。
+
 启动 SRB rollout：
 
 ```bash
@@ -45,7 +56,7 @@ uv run python examples/srb/main.py \
 
 说明：
 
-- 对 manipulation visual 任务，SRB 会返回 `image_cam_base` 和 `image_cam_wrist`，adapter 会把它们映射到模型的 base / wrist image slots。
+- 对 manipulation visual 任务，SRB 会返回 `image_base` 和 `image_wrist`，adapter 会把它们映射到模型的 base / wrist image slots。
 - 对非 visual 任务，adapter 会自动补零图像；这能跑通接口，但效果会明显依赖你训练时是否也是无视觉输入。
 - 当前脚本把 SRB 环境固定成 `num_envs=1`，因为 OpenPI 的 policy server 接口是单条 observation 推理。
 
@@ -59,16 +70,16 @@ uv run python examples/srb/main.py \
 - `state`: 任务相关状态。
 - `state_dyn`: 可选，动态状态。
 - `proprio_dyn`: 可选，动态本体状态。
-- `image_cam_base`: 可选，SRB base camera RGB。
-- `image_cam_wrist`: 可选，SRB wrist camera RGB。
+- `image_base`: 可选，SRB base camera RGB。
+- `image_wrist`: 可选，SRB wrist camera RGB。
 - `actions`: 环境动作，形状应为 `(action_dim,)`。
 - `task`: 任务文本。配合 `prompt_from_task=True` 自动生成 prompt。
 
 当前模板 config 默认：
 
 - 输出动作维度 `action_dim=7`
-- 状态拼接顺序 `("proprio", "state")`
-- 图像 key `("image_cam_base", "image_cam_wrist")`
+- 状态拼接顺序 `("proprio")`
+- 图像 key `("image_base", "image_wrist")`
 
 如果你的 SRB 任务动作维度不是 7，或者你想把 `state_dyn` / `proprio_dyn` 也拼进去，需要在 `SRBDataConfig` 里改这些字段。
 

@@ -13,8 +13,8 @@ def make_srb_example() -> dict:
     return {
         "proprio": np.random.rand(9).astype(np.float32),
         "state": np.random.rand(18).astype(np.float32),
-        "image_cam_base": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
-        "image_cam_wrist": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "image_base": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
+        "image_wrist": np.random.randint(256, size=(224, 224, 3), dtype=np.uint8),
         "prompt": "complete the task",
     }
 
@@ -66,28 +66,20 @@ class SRBInputs(transforms.DataTransformFn):
     """Converts SRB observations into the model input format.
 
     Expected SRB inputs are flat dictionaries produced by SRB envs, e.g. keys such as
-    `state`, `proprio`, `state_dyn`, `proprio_dyn`, `image_cam_base`, and `image_cam_wrist`.
+    `state`, `proprio`, `state_dyn`, `proprio_dyn`, `image_base`, and `image_wrist`.
     The transform also accepts an `image` dictionary for offline datasets if users choose to
     store the raw camera frames under nested keys.
     """
 
     action_dim: int
     model_type: _model.ModelType
-    observation_keys: Sequence[str] = ("proprio", "state")
-    image_keys: Sequence[str] = ("image_cam_base", "image_cam_wrist")
+    observation_keys: Sequence[str] = ("proprio",)
+    image_keys: Sequence[str] = ("image_base", "image_wrist")
     default_image_resolution: tuple[int, int] = _model.IMAGE_RESOLUTION
     strict_state_dim: bool = False
 
     def __call__(self, data: dict) -> dict:
         state = _build_state(data, self.observation_keys)
-        if state.shape[-1] > self.action_dim:
-            if self.strict_state_dim:
-                raise ValueError(
-                    f"SRB state dim {state.shape[-1]} exceeds model action dim {self.action_dim}. "
-                    "Either reduce observation_keys or disable strict_state_dim."
-                )
-            state = state[: self.action_dim]
-        state = transforms.pad_to_dim(state, self.action_dim)
 
         base_image = _resolve_image(data, self.image_keys[0])
         wrist_image = _resolve_image(data, self.image_keys[1]) if len(self.image_keys) > 1 else None
