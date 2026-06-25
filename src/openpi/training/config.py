@@ -388,11 +388,15 @@ class SRBDataConfig(DataConfigFactory):
         )
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
+        # Get the base config and set action_sequence_keys from the base_config
+        base_config = self.create_base_config(assets_dirs, model_config)
+        action_sequence_keys = base_config.action_sequence_keys
         return dataclasses.replace(
-            self.create_base_config(assets_dirs, model_config),
+            base_config,
             repack_transforms=self.repack_transforms,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+            action_sequence_keys=action_sequence_keys,
         )
 
 
@@ -978,9 +982,9 @@ _CONFIGS = [
         name="pi05_srb",
         model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False),
         data=SRBDataConfig(
-            repo_id="ur5e",
+            repo_id="srb_dataset",
             base_config=DataConfig(prompt_from_task=True),
-            action_dim=8,
+            action_dim=7,
             observation_keys=("proprio",),
             image_keys=("image_base", "image_wrist"),
         ),
@@ -992,15 +996,135 @@ _CONFIGS = [
         name="pi0_fast_srb",
         model=pi0_fast.Pi0FASTConfig(action_dim=8, action_horizon=16, max_token_len=220),
         data=SRBDataConfig(
-            repo_id="ur5e",
+            repo_id="srb_dataset",
             base_config=DataConfig(prompt_from_task=True),
-            action_dim=8,
+            action_dim=7,
             observation_keys=("proprio",),
             image_keys=("image_base", "image_wrist"),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi0_fast_base/params"),
         num_train_steps=30_000,
         batch_size=64,
+    ),
+    TrainConfig(
+        name="srb_train",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False,
+                                   paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",),
+        data=SRBDataConfig(
+            repo_id="srb_dataset",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            action_dim=7,
+            observation_keys=("observation.state",),
+            image_keys=("observation.images.image_base", "observation.images.image_wrist"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20,
+        batch_size=32,
+        exp_name="srb_sample",
+        save_interval=100,
+        overwrite=True,
+        # num_train_steps=10,
+        wandb_enabled=False,
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False,
+                    paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",).get_freeze_filter()
+    ),
+    #
+    # Single-step pi0.5 configs (no diffusion, direct action prediction).
+    #
+    TrainConfig(
+        name="pi05_single_step_libero",
+        model=pi0_config.Pi0SingleStepConfig(
+            action_dim=7,
+            action_horizon=10,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_single_step_libero_lora",
+        model=pi0_config.Pi0SingleStepConfig(
+            action_dim=7,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0SingleStepConfig(
+            action_dim=7,
+            action_horizon=10,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi05_single_step_srb",
+        model=pi0_config.Pi0SingleStepConfig(
+            action_dim=7,
+            action_horizon=16,
+        ),
+        data=SRBDataConfig(
+            repo_id="srb_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+            action_dim=7,
+            observation_keys=("proprio",),
+            image_keys=("image_base", "image_wrist"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_single_step_srb_lora",
+        model=pi0_config.Pi0SingleStepConfig(
+            action_dim=7,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=SRBDataConfig(
+            repo_id="srb_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+            action_dim=7,
+            observation_keys=("proprio",),
+            image_keys=("image_base", "image_wrist"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+        freeze_filter=pi0_config.Pi0SingleStepConfig(
+            action_dim=7,
+            action_horizon=16,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="debug_single_step",
+        model=pi0_config.Pi0SingleStepConfig(
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_single_step",
+        wandb_enabled=False,
     ),
     #
     # Debugging configs.

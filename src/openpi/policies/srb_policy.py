@@ -80,6 +80,17 @@ class SRBInputs(transforms.DataTransformFn):
 
     def __call__(self, data: dict) -> dict:
         state = _build_state(data, self.observation_keys)
+        
+        if state.shape[-1] > 8:
+            if self.strict_state_dim:
+                raise ValueError(
+                    f"SRB state dim {state.shape[-1]} exceeds model action dim {self.action_dim}. "
+                    "Either reduce observation_keys or disable strict_state_dim."
+                )
+            state = state[: 8]
+        # state = transforms.pad_to_dim(state, self.action_dim)
+
+
 
         base_image = _resolve_image(data, self.image_keys[0])
         wrist_image = _resolve_image(data, self.image_keys[1]) if len(self.image_keys) > 1 else None
@@ -111,8 +122,10 @@ class SRBInputs(transforms.DataTransformFn):
             "image_mask": dict(zip(names, image_masks, strict=True)),
         }
 
-        if "actions" in data:
-            actions = np.asarray(data["actions"], dtype=np.float32)
+        # Support both "actions" and "action" keys for compatibility
+        action_key = "actions" if "actions" in data else "action" if "action" in data else None
+        if action_key is not None:
+            actions = np.asarray(data[action_key], dtype=np.float32)
             if actions.ndim == 1:
                 actions = actions[None, :]
             if actions.shape[-1] > self.action_dim:

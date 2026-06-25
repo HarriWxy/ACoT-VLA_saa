@@ -133,6 +133,51 @@ bash scripts/server.sh <GPU_ID> <PORT>
 
 ---
 
+##  Single-Step Pi0.5 Variant
+
+We provide a **single-step action prediction** variant that replaces the standard 10-step flow matching diffusion with direct action regression. This achieves **~10x faster inference** by performing a single forward pass instead of iterative denoising.
+
+### Architecture
+
+| | Pi0.5 (Standard) | Pi0 Single-Step |
+|---|---|---|
+| **Inference** | 10-step Euler integration | **1 forward pass** |
+| **Training Loss** | Flow matching: `‖v_t - u_t‖²` | L2 regression: `‖predicted - target‖²` |
+| **Input** | Noisy actions + timestep | Learnable query tokens |
+| **Backbone** | PaliGemma + adaRMS | Same |
+| **Speed** | Baseline | **~10x faster** |
+
+### Available Configs
+
+| Config | Model | Data | Finetune |
+|---|---|---|---|
+| `pi05_single_step_libero` | Pi0SingleStepConfig | LIBERO | Full |
+| `pi05_single_step_libero_lora` | Pi0SingleStepConfig | LIBERO | LoRA |
+| `pi05_single_step_srb` | Pi0SingleStepConfig | SRB | Full |
+| `pi05_single_step_srb_lora` | Pi0SingleStepConfig | SRB | LoRA |
+| `debug_single_step` | dummy variants | FakeData | - |
+
+### Usage
+
+```bash
+# Compute normalization statistics
+uv run python scripts/compute_norm_stats.py --config-name pi05_single_step_libero
+
+# Train
+bash scripts/train.sh pi05_single_step_libero my_exp
+
+# Serve (single-step inference)
+bash scripts/server.sh 0 8000
+```
+
+### Key Notes
+
+- **Weight compatibility**: Cannot directly load pi0.5 pretrained weights (missing time MLP). Use **LoRA finetuning** from `pi05_base` checkpoint instead.
+- **Model type**: Reuses `ModelType.PI05` for compatibility with existing training infrastructure.
+- **Source**: `src/openpi/models/pi0_single_step.py`
+
+---
+
 ## 📅 TODO List
 
 * [x] Release core EAR and IAR training modules.

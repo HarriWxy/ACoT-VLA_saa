@@ -6,21 +6,31 @@ import tyro
 
 from openpi_client import base_policy as _base_policy
 from openpi.policies import debug_policy as _debug_policy
-from openpi.serving import websocket_policy_server
+# from openpi.serving import websocket_policy_server
+from openpi.serving import websocket_policy_server_sample as wps_sample
 
 
 @dataclasses.dataclass
 class Args:
-    policy_mode: Literal["model", "random", "zero"] = "model"
+    policy_mode: Literal["model", "random", "zero"] = "random"
     config_name: str = "pi05_srb"
     checkpoint_dir: str = ".cache/openpi/openpi-assets/checkpoints/pi05_base"
     action_horizon: int = 16
-    action_dim: int = 8
+    action_dim: int = 7
     random_seed: int = 0
     random_action_scale: float = 0.25
     host: str = "0.0.0.0" # ""127.168.1.116
     port: int = 8899
     default_prompt: str | None = None
+    
+    # ── 探索噪声参数 ──
+    # 噪声模式: none / output / initial / both
+    exploration_mode: str = "none"
+    exploration_noise_std: float = 0.05   # 输出噪声标准差
+    ou_theta: float = 0.15                # OU 均值回归速度
+    ou_sigma: float = 0.3                 # OU 噪声强度
+    initial_noise_scale: float = 1.0      # 初始噪声缩放因子
+    num_steps: int | None = None          # 流匹配去噪步数, None=模型默认
 
 
 def _create_policy(args: Args) -> _base_policy.BasePolicy:
@@ -49,14 +59,27 @@ def _create_policy(args: Args) -> _base_policy.BasePolicy:
 def main(args: Args) -> None:
     policy = _create_policy(args)
 
-    server = websocket_policy_server.WebsocketPolicyServer(
+    config = wps_sample.ServerConfig(
+        policy=policy,
+        host=args.host,
+        port=args.port,
+        action_dim=args.action_dim,
+        exploration_mode=args.exploration_mode,
+        exploration_noise_std=args.exploration_noise_std,
+        ou_theta=args.ou_theta,
+        ou_sigma=args.ou_sigma,
+        initial_noise_scale=args.initial_noise_scale,
+        num_steps=args.num_steps,
+    )
+
+    server = wps_sample.WebsocketPolicyServer(
         policy=policy,
         host=args.host,
         port=args.port,
         metadata=policy.metadata,
+        config=config,
     )
     server.serve_forever()
-    pass
 
 
 if __name__ == "__main__":
