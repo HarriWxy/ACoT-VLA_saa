@@ -33,6 +33,7 @@ class ModelType(enum.Enum):
     PI0 = "pi0"
     PI0_FAST = "pi0_fast"
     PI05 = "pi05"
+    PHYSICS_AWARE = "physics_aware"  #  Add a new model type for physics-aware model
 
 
 # The model always expects these images
@@ -106,6 +107,9 @@ class Observation(Generic[ArrayT]):
     # Token loss mask (for FAST autoregressive model).
     token_loss_mask: at.Bool[ArrayT, "*b l"] | None = None
 
+    # Add：连续物理参数，shape 为 (B, physics_dim)
+    physics_params: at.Float[ArrayT, "*b p"] | None = None
+
     @classmethod
     def from_dict(cls, data: at.PyTree[ArrayT]) -> "Observation[ArrayT]":
         """This method defines the mapping between unstructured data (i.e., nested dict) to the structured Observation format."""
@@ -126,6 +130,7 @@ class Observation(Generic[ArrayT]):
             tokenized_prompt_mask=data.get("tokenized_prompt_mask"),
             token_ar_mask=data.get("token_ar_mask"),
             token_loss_mask=data.get("token_loss_mask"),
+            physics_params=data.get("physics_params") # add for physics-aware model
         )
 
     def to_dict(self) -> at.PyTree[ArrayT]:
@@ -198,13 +203,14 @@ def preprocess_observation(
             out_masks[key] = jnp.asarray(observation.image_masks[key])
 
     return Observation(
-        images=out_images,
-        image_masks=out_masks,
-        state=observation.state,
-        tokenized_prompt=observation.tokenized_prompt,
-        tokenized_prompt_mask=observation.tokenized_prompt_mask,
-        token_ar_mask=observation.token_ar_mask,
-        token_loss_mask=observation.token_loss_mask,
+        images = out_images,
+        image_masks = out_masks,
+        state = observation.state,
+        tokenized_prompt = observation.tokenized_prompt,
+        tokenized_prompt_mask = observation.tokenized_prompt_mask,
+        token_ar_mask = observation.token_ar_mask,
+        token_loss_mask = observation.token_loss_mask,
+        physics_params = observation.physics_params,
     )
 
 

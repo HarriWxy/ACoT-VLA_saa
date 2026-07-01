@@ -305,6 +305,13 @@ def main(config: _config.TrainConfig):
             out_shardings=(train_state_sharding, replicated_sharding),
             donate_argnums=(1,),
         )
+    elif config.model.model_type == _model.ModelType.PHYSICS_AWARE:  # ← 新增
+        ptrain_step = jax.jit(
+            functools.partial(train_step, config),  # 复用标准 train_step
+            in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
     else:
         ptrain_step = jax.jit(
             functools.partial(train_step, config),

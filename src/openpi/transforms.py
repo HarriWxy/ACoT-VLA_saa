@@ -430,6 +430,38 @@ def pad_to_dim(x: np.ndarray, target_dim: int, axis: int = -1, value: float = 0.
     return x
 
 
+@dataclasses.dataclass(frozen=True)
+class InjectPhysicsParams(DataTransformFn):
+    """从数据字典中提取物理参数并注入为 physics_params。
+
+    支持两种数据来源：
+    1. 直接从 data["physics_params"] 读取（已经预处理好的 ndarray）
+    2. 从 data 中的独立键（如 "gravity", "friction_coeff"）拼接
+
+    如果两者都不存在，使用 default_values 填充。
+    """
+
+    physics_keys: Sequence[str] = ("gravity", "friction_coeff", "robot_mass",
+                                    "air_density", "terrain_roughness")
+    default_values: Sequence[float] = (9.81, 0.5, 5.0, 1.225, 0.3)
+
+    def __call__(self, data: DataDict) -> DataDict:
+        if "physics_params" in data:
+            # 已经预处理好的物理参数
+            data["physics_params"] = np.asarray(data["physics_params"], dtype=np.float32)
+            return data
+
+        # 从独立键拼接
+        values = []
+        for key, default in zip(self.physics_keys, self.default_values):
+            if key in data:
+                values.append(float(data[key]))
+            else:
+                values.append(default)
+
+        data["physics_params"] = np.array(values, dtype=np.float32)
+        return data
+
 def make_bool_mask(*dims: int) -> tuple[bool, ...]:
     """Make a boolean mask for the given dimensions.
 

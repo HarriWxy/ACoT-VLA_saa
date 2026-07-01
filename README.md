@@ -205,3 +205,12 @@ bash scripts/server.sh 0 8000
 ## 🙏 Acknowledgements
 
 This repo is built upon the [OpenPI](https://github.com/Physical-Intelligence/openpi) framework. We sincerely thank the authors for their contributions to the community.
+
+## 研究计划
+
+1. 先将就把 方案B 调通 物理 + meanflow + rl 微调 + 思维链 
+  - 1. 怎么应对不同的物理数据维度的缺失 适应不同的数据格式  尽量不要创造新的数据集 只用现有的物理数据集 缺省值默认
+2. 接入 gemma 4 2b/4b
+3. 对比 pi 0.5 / acot-vla
+4. 对比 quart-vla (tokenize)
+

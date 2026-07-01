@@ -17,10 +17,15 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
+from openpi.models.pi0_config import PhysicsAwareConfig  # ← 新增
+
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
+import openpi.policies.gfootball_policy as gfootball_policy
 import openpi.policies.libero_policy as libero_policy
 import openpi.policies.srb_policy as srb_policy
+import openpi.policies.planetary_policy as pla_policy
+
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -399,6 +404,97 @@ class SRBDataConfig(DataConfigFactory):
             action_sequence_keys=action_sequence_keys,
         )
 
+@dataclasses.dataclass(frozen=True)
+class PlanetaryDataConfig(DataConfigFactory):
+    """行星机器人数据集配置。
+
+    数据集中每个样本除了标准的 image/state/actions 外，
+    还包含物理参数字段 (gravity, friction_coeff 等).
+    """
+
+    default_prompt: str | None = None
+    action_dim: int = 7
+    physics_dim: int = 5
+    image_keys: Sequence[str] = ("image_base", "image_wrist")
+    physics_keys: Sequence[str] = (
+        "gravity", "friction_coeff", "robot_mass", "air_density", "terrain_roughness"
+    )
+
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default_factory=_transforms.Group
+    )
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                pla_policy.PlanetaryInputs(
+                    action_dim=self.action_dim,
+                    physics_keys=self.physics_keys,
+                    image_keys=self.image_keys,
+                )
+            ],
+            outputs=[pla_policy.PlanetaryOutputs(action_dim=self.action_dim)],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        base_config = self.create_base_config(assets_dirs, model_config)
+
+        return dataclasses.replace(
+            base_config,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class GfootballDataConfig(DataConfigFactory):
+    """Gfootball multi-agent VLA dataset configuration.
+
+    Supports both 5v5 and 11v11 scenarios. Each agent's observation is
+    converted to image + state format for VLA training.
+
+    Observation format:
+      - image: rendered game frame (72x96x3)
+      - state: simple115_v2 vector (115-dim)
+      - action: discrete action index (0-18)
+      - prompt: role-based task description
+    """
+
+    default_prompt: str | None = None
+    action_dim: int = 19  # 19 discrete football actions
+    n_agents: int = 4  # 4 for 5v5, 11 for 11v11
+    team_id: int = 0  # 0=left, 1=right
+    repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(
+        default_factory=_transforms.Group
+    )
+
+    @override
+    def create(
+        self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig
+    ) -> DataConfig:
+        data_transforms = _transforms.Group(
+            inputs=[
+                gfootball_policy.GfootballInputs(
+                    action_dim=self.action_dim,
+                    model_type=model_config.model_type,
+                )
+            ],
+            outputs=[gfootball_policy.GfootballOutputs(
+                action_dim=self.action_dim,
+            )],
+        )
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+        base_config = self.create_base_config(assets_dirs, model_config)
+
+        return dataclasses.replace(
+            base_config,
+            repack_transforms=self.repack_transforms,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+        )
 
 @dataclasses.dataclass(frozen=True)
 class RLDSDroidDataConfig(DataConfigFactory):
@@ -1164,6 +1260,194 @@ _CONFIGS = [
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),
+
+        #
+    # Physics-aware single-step configs (planetary robotics).
+    #
+    TrainConfig(
+        name="physics_aware_planetary",
+        model=PhysicsAwareConfig(
+            paligemma_variant="gemma_2b",
+            action_expert_variant="gemma_300m",
+            action_dim=7,
+            action_horizon=10,
+            physics_dim=5,
+            num_physics_tokens=4,
+            use_action_queries=True,
+        ),
+        data=PlanetaryDataConfig(
+            repo_id="your_planetary_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+            action_dim=7,
+            physics_dim=5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="physics_aware_planetary_lora",
+        model=PhysicsAwareConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7,
+            action_horizon=10,
+            physics_dim=5,
+            num_physics_tokens=4,
+            use_action_queries=True,
+        ),
+        data=PlanetaryDataConfig(
+            repo_id="your_planetary_dataset",
+            base_config=DataConfig(prompt_from_task=True),
+            action_dim=7,
+            physics_dim=5,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
+        freeze_filter=PhysicsAwareConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=7,
+            action_horizon=10,
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="debug_physics_aware",
+        model=PhysicsAwareConfig(
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+            action_dim=7,
+            action_horizon=10,
+            physics_dim=5,
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_physics_aware",
+        wandb_enabled=False,
+    ),
+    #
+    # Gfootball multi-agent VLA configs.
+    #
+    # PI0-FAST with LoRA for gfootball 5v5 (recommended for discrete actions)
+    TrainConfig(
+        name="pi0_fast_gfootball_5v5",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=19,
+            action_horizon=1,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ),
+        data=GfootballDataConfig(
+            repo_id="gfootball_5v5_dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            action_dim=19,
+            n_agents=4,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        num_train_steps=30_000,
+        batch_size=32,
+        exp_name="gfootball_5v5",
+        freeze_filter=pi0_fast.Pi0FASTConfig(
+            action_dim=19,
+            action_horizon=1,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # ACoT-VLA with explicit+implicit reasoning for gfootball 5v5
+    TrainConfig(
+        name="acot_gfootball_5v5_reasoning",
+        model=gfootball_policy.ACOTGfootballConfig(
+            action_dim=19,
+            action_horizon=1,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            coarse_action_expert_variant="gemma_300m_lora",
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+        ),
+        data=GfootballDataConfig(
+            repo_id="gfootball_5v5_dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            action_dim=19,
+            n_agents=4,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi05_base/params"
+        ),
+        num_train_steps=50_000,
+        batch_size=16,
+        exp_name="gfootball_5v5_reasoning",
+        freeze_filter=gfootball_policy.ACOTGfootballConfig(
+            action_dim=19,
+            action_horizon=1,
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            coarse_action_expert_variant="gemma_300m_lora",
+            adopt_explicit_action_reasoner=True,
+            adopt_implicit_action_reasoner=True,
+            downsample_based_implicit_extractor=True,
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # PI0-FAST full finetune for gfootball 11v11
+    TrainConfig(
+        name="pi0_fast_gfootball_11v11",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=19,
+            action_horizon=1,
+        ),
+        data=GfootballDataConfig(
+            repo_id="gfootball_11v11_dataset",
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            action_dim=19,
+            n_agents=11,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader(
+            "gs://openpi-assets/checkpoints/pi0_fast_base/params"
+        ),
+        num_train_steps=50_000,
+        batch_size=32,
+        exp_name="gfootball_11v11",
+    ),
+    # Debug config for gfootball
+    TrainConfig(
+        name="debug_gfootball",
+        model=pi0_fast.Pi0FASTConfig(
+            action_dim=19,
+            action_horizon=1,
+            paligemma_variant="dummy",
+            action_expert_variant="dummy",
+        ),
+        data=FakeDataConfig(),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_gfootball",
+        wandb_enabled=False,
+    ),
+
 ]
 
 if len({config.name for config in _CONFIGS}) != len(_CONFIGS):
