@@ -178,6 +178,10 @@ def build_model(config: _config.TrainConfig, device: torch.device) -> torch.nn.M
             query_based_implicit_extractor=getattr(config.model, "query_based_implicit_extractor", False),
             attention_pooling_implicit_extractor=getattr(config.model, "attention_pooling_implicit_extractor", False),
             downsample_based_implicit_extractor=getattr(config.model, "downsample_based_implicit_extractor", False),
+            use_one_step_inference=getattr(config.model, "use_one_step_inference", False),
+            exploration_std=getattr(config.model, "exploration_std", 0.0),
+            self_consistency_loss_scale=getattr(config.model, "self_consistency_loss_scale", 0.0),
+            sc_midpoint_samples=getattr(config.model, "sc_midpoint_samples", 1),
         )
 
         model = ACOT_VLAPytorch(model_cfg).to(device)
@@ -395,6 +399,17 @@ def compute_rl_loss(
         # ACoT-VLA forward pass returns scalar loss (sum of coarse + fine)
         loss = model(observation, actions, coarse_actions)
 
+        # Add self-consistency loss if configured (OFP path compression)
+        _base = get_model(model)
+        sc_scale = getattr(_base, 'self_consistency_loss_scale', 0.0)
+        sc_samples = getattr(_base, 'sc_midpoint_samples', 1)
+        if sc_scale > 0 and coarse_actions is not None and _base.training:
+            sc_loss = _base.compute_self_consistency_loss(
+                observation, actions, coarse_actions,
+                num_midpoint_samples=sc_samples,
+            )
+            loss = loss + sc_scale * sc_loss
+
         # For ACoT-VLA, we weight the loss by mean advantage
         # (since we can't get per-sample loss without modifying the forward pass)
         clipped_adv = advantages.clamp(-clip_advantage, clip_advantage)
@@ -413,6 +428,8 @@ def compute_rl_loss(
             "std_advantage": advantages.std().item(),
             "positive_advantage_ratio": (advantages > 0).float().mean().item(),
         }
+        if sc_scale > 0:
+            metrics["sc_loss"] = sc_loss.item() if isinstance(sc_loss, torch.Tensor) else sc_loss
 
     else:
         # PI0 forward pass: returns per-element MSE loss [B, action_horizon, action_dim]

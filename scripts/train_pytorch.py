@@ -389,24 +389,53 @@ def train_loop(config: _config.TrainConfig):
             torch.cuda.empty_cache()
         logging.info("Cleared sample batch and data loader from memory")
 
-    # Build model
-    if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
-        # Convert dataclass to Pi0Config if needed
-        model_cfg = openpi.models.pi0_config.Pi0Config(
+    # Build model (PI0 or ACoT-VLA)
+    is_acot = hasattr(config.model, "adopt_explicit_action_reasoner") or \
+              hasattr(config.model, "coarse_action_horizon") or \
+              hasattr(config.model, "adopt_implicit_action_reasoner")
+
+    if is_acot:
+        from openpi.models_pytorch.acot_vla_pytorch import ACOTConfigPytorch, ACOT_VLAPytorch
+
+        model_cfg = ACOTConfigPytorch(
             dtype=config.pytorch_training_precision,
             action_dim=config.model.action_dim,
             action_horizon=config.model.action_horizon,
+            coarse_action_horizon=getattr(config.model, "coarse_action_horizon", 50),
             max_token_len=config.model.max_token_len,
             paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
+            coarse_action_expert_variant=getattr(config.model, "coarse_action_expert_variant", "gemma_300m"),
             action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
             pi05=getattr(config.model, "pi05", False),
+            adopt_explicit_action_reasoner=getattr(config.model, "adopt_explicit_action_reasoner", False),
+            adopt_implicit_action_reasoner=getattr(config.model, "adopt_implicit_action_reasoner", False),
+            query_based_implicit_extractor=getattr(config.model, "query_based_implicit_extractor", False),
+            attention_pooling_implicit_extractor=getattr(config.model, "attention_pooling_implicit_extractor", False),
+            downsample_based_implicit_extractor=getattr(config.model, "downsample_based_implicit_extractor", False),
+            use_one_step_inference=getattr(config.model, "use_one_step_inference", False),
+            exploration_std=getattr(config.model, "exploration_std", 0.0),
+            self_consistency_loss_scale=getattr(config.model, "self_consistency_loss_scale", 0.0),
+            sc_midpoint_samples=getattr(config.model, "sc_midpoint_samples", 1),
         )
-    else:
-        model_cfg = config.model
-        # Update dtype to match pytorch_training_precision
-        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+        model = ACOT_VLAPytorch(model_cfg).to(device)
+        logging.info(f"Built ACoT-VLA model: {model_cfg}")
 
-    model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
+    else:
+        if not isinstance(config.model, openpi.models.pi0_config.Pi0Config):
+            model_cfg = openpi.models.pi0_config.Pi0Config(
+                dtype=config.pytorch_training_precision,
+                action_dim=config.model.action_dim,
+                action_horizon=config.model.action_horizon,
+                max_token_len=config.model.max_token_len,
+                paligemma_variant=getattr(config.model, "paligemma_variant", "gemma_2b"),
+                action_expert_variant=getattr(config.model, "action_expert_variant", "gemma_300m"),
+                pi05=getattr(config.model, "pi05", False),
+            )
+        else:
+            model_cfg = config.model
+            object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+
+        model = openpi.models_pytorch.pi0_pytorch.PI0Pytorch(model_cfg).to(device)
 
     if hasattr(model, "gradient_checkpointing_enable"):
         enable_gradient_checkpointing = True
@@ -540,7 +569,32 @@ def train_loop(config: _config.TrainConfig):
                 pg["lr"] = lr_schedule(global_step)
 
             # Forward pass
-            losses = model(observation, actions)
+            # Detect ACoT-VLA model (handles DDP wrapper)
+            _base = model.module if isinstance(model, torch.nn.parallel.DistributedDataParallel) else model
+            _is_acot = hasattr(_base, 'compute_self_consistency_loss')
+
+            if _is_acot:
+                # ACoT-VLA: extract coarse_actions if available
+                coarse_actions = None
+                if hasattr(observation, 'coarse_actions'):
+                    coarse_actions = observation.coarse_actions.to(torch.float32).to(device)
+                elif isinstance(observation, dict) and "coarse_actions" in observation:
+                    coarse_actions = observation["coarse_actions"].to(torch.float32).to(device)
+
+                losses = model(observation, actions, coarse_actions)
+
+                # Add self-consistency loss if configured
+                sc_scale = getattr(_base, 'self_consistency_loss_scale', 0.0)
+                sc_samples = getattr(_base, 'sc_midpoint_samples', 1)
+                if sc_scale > 0 and coarse_actions is not None and _base.training:
+                    sc_loss = _base.compute_self_consistency_loss(
+                        observation, actions, coarse_actions,
+                        num_midpoint_samples=sc_samples,
+                    )
+                    losses = losses + sc_scale * sc_loss
+            else:
+                losses = model(observation, actions)
+
             # Ensure losses is a tensor and handle different return types
             if isinstance(losses, list | tuple):
                 losses = torch.stack(losses)
