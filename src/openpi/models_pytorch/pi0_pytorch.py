@@ -10,6 +10,20 @@ import openpi.models.gemma as _gemma
 from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
+# Gemma 4 support
+_GEMMA4_VARIANTS = {"gemma4_300m", "gemma4_300m_lora", "gemma4_2b", "gemma4_2b_lora"}
+
+
+def _is_gemma4_variant(variant: str) -> bool:
+    return variant in _GEMMA4_VARIANTS
+
+
+def _has_lora(config) -> bool:
+    """Check if any variant in the config uses LoRA."""
+    paligemma_lora = "lora" in config.paligemma_variant
+    expert_lora = "lora" in config.action_expert_variant
+    return paligemma_lora or expert_lora
+
 
 def get_safe_dtype(target_dtype, device_type):
     """Get a safe dtype for the given device type."""
@@ -90,12 +104,24 @@ class PI0Pytorch(nn.Module):
         paligemma_config = _gemma.get_config(config.paligemma_variant)
         action_expert_config = _gemma.get_config(config.action_expert_variant)
 
-        self.paligemma_with_expert = PaliGemmaWithExpertModel(
-            paligemma_config,
-            action_expert_config,
-            use_adarms=[False, True] if self.pi05 else [False, False],
-            precision=config.dtype,
-        )
+        self._is_gemma4 = _is_gemma4_variant(config.paligemma_variant)
+
+        if self._is_gemma4:
+            from openpi.models_pytorch.gemma4_pytorch import PaliGemma4WithExpertModel
+
+            self.paligemma_with_expert = PaliGemma4WithExpertModel(
+                paligemma_config,
+                action_expert_config,
+                use_adarms=[False, True] if self.pi05 else [False, False],
+                precision=config.dtype,
+            )
+        else:
+            self.paligemma_with_expert = PaliGemmaWithExpertModel(
+                paligemma_config,
+                action_expert_config,
+                use_adarms=[False, True] if self.pi05 else [False, False],
+                precision=config.dtype,
+            )
 
         self.action_in_proj = nn.Linear(config.action_dim, action_expert_config.width)
         self.action_out_proj = nn.Linear(action_expert_config.width, config.action_dim)
@@ -115,30 +141,108 @@ class PI0Pytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
-        msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
-        try:
-            from transformers.models.siglip import check
+        # transformers_replace check is only needed for Gemma 2 based models
+        # (Gemma 4 is natively supported in transformers 5.x)
+        if not self._is_gemma4:
+            msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
+            try:
+                from transformers.models.siglip import check
 
-            if not check.check_whether_transformers_replace_is_installed_correctly():
-                raise ValueError(msg)
-        except ImportError:
-            raise ValueError(msg) from None
+                if not check.check_whether_transformers_replace_is_installed_correctly():
+                    raise ValueError(msg)
+            except ImportError:
+                raise ValueError(msg) from None
+
+        # --- LoRA injection for Gemma 4 ---
+        self._lora_injected = False
+        if self._is_gemma4 and _has_lora(config):
+            self._inject_lora(paligemma_config, action_expert_config)
+
+    def _inject_lora(self, vlm_config, expert_config):
+        """Inject LoRA adapters into Gemma 4 model layers."""
+        vlm_lora = vlm_config.lora_configs.get("attn") or vlm_config.lora_configs.get("ffn")
+        expert_lora = expert_config.lora_configs.get("attn") or expert_config.lora_configs.get("ffn")
+
+        # Only inject into Gemma4 text models (not vision tower)
+        self.paligemma_with_expert.inject_lora(
+            vlm_lora_config=vlm_lora if "lora" in self.config.paligemma_variant else None,
+            expert_lora_config=expert_lora if "lora" in self.config.action_expert_variant else None,
+        )
+        self._lora_injected = True
+        trainable, total = self.count_trainable_params()
+        logging.info(f"LoRA injected: {trainable / 1e6:.2f}M / {total / 1e6:.2f}M trainable ({100 * trainable / total:.2f}%)")
+
+    def freeze_non_lora_params(self):
+        """Freeze all parameters except LoRA adapters and action heads.
+
+        Keeps trainable:
+        - LoRA A/B parameters (lora_A, lora_B)
+        - Action projection layers (action_in_proj, action_out_proj)
+        - State/time MLP layers (state_proj, action_time_mlp_*, time_mlp_*)
+        """
+        from openpi.models_pytorch.lora_pytorch import freeze_non_lora_params as _freeze
+
+        trainable_count = _freeze(self.paligemma_with_expert)
+
+        # Always keep action heads trainable
+        action_head_params = [
+            self.action_in_proj.parameters(),
+            self.action_out_proj.parameters(),
+        ]
+        if self.pi05:
+            action_head_params.extend([
+                self.time_mlp_in.parameters(),
+                self.time_mlp_out.parameters(),
+            ])
+        else:
+            action_head_params.extend([
+                self.state_proj.parameters(),
+                self.action_time_mlp_in.parameters(),
+                self.action_time_mlp_out.parameters(),
+            ])
+
+        for param_group in action_head_params:
+            for p in param_group:
+                p.requires_grad_(True)
+                trainable_count += p.numel()
+
+        logging.info(f"Froze non-LoRA params. Trainable: {trainable_count / 1e6:.2f}M")
+        return trainable_count
+
+    def count_trainable_params(self) -> tuple[int, int]:
+        """Count trainable and total parameters."""
+        trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in self.parameters())
+        return trainable, total
+
+    def get_lora_state_dict(self) -> dict:
+        """Extract only LoRA parameters for saving."""
+        return {k: v for k, v in self.state_dict().items() if "lora_A" in k or "lora_B" in k}
 
     def gradient_checkpointing_enable(self):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
+        if self._is_gemma4:
+            self.paligemma_with_expert.gemma4_vlm.model.gradient_checkpointing = True
+            self.paligemma_with_expert.gemma4_vlm.model.gradient_checkpointing = True
+            self.paligemma_with_expert.gemma4_expert.model.gradient_checkpointing = True
+        else:
+            self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = True
+            self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = True
+            self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = True
 
         logging.info("Enabled gradient checkpointing for PI0Pytorch model")
 
     def gradient_checkpointing_disable(self):
         """Disable gradient checkpointing."""
         self.gradient_checkpointing_enabled = False
-        self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
-        self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
-        self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
+        if self._is_gemma4:
+            self.paligemma_with_expert.gemma4_vlm.model.gradient_checkpointing = False
+            self.paligemma_with_expert.gemma4_expert.model.gradient_checkpointing = False
+        else:
+            self.paligemma_with_expert.paligemma.language_model.gradient_checkpointing = False
+            self.paligemma_with_expert.paligemma.vision_tower.gradient_checkpointing = False
+            self.paligemma_with_expert.gemma_expert.model.gradient_checkpointing = False
 
         logging.info("Disabled gradient checkpointing for PI0Pytorch model")
 
@@ -158,6 +262,18 @@ class PI0Pytorch(nn.Module):
         """Helper method to prepare 4D attention masks for transformer."""
         att_2d_masks_4d = att_2d_masks[:, None, :, :]
         return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+
+    def _prepare_attention_masks_for_gemma4(self, att_2d_masks, sliding_window=512):
+        """Prepare both full causal and sliding window 4D masks for Gemma 4."""
+        full_mask = self._prepare_attention_masks_4d(att_2d_masks)
+        # Sliding window: additionally mask positions outside the window
+        seq_len = att_2d_masks.shape[-1]
+        position_ids_q = torch.arange(seq_len, device=att_2d_masks.device)[:, None]
+        position_ids_k = torch.arange(seq_len, device=att_2d_masks.device)[None, :]
+        sliding_mask_2d = (position_ids_q - position_ids_k) <= sliding_window
+        combined_2d = att_2d_masks & sliding_mask_2d
+        sliding_mask = self._prepare_attention_masks_4d(combined_2d)
+        return {"full_attention": full_mask, "sliding_attention": sliding_mask}
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -330,10 +446,11 @@ class PI0Pytorch(nn.Module):
 
         prefix_embs, prefix_pad_masks, prefix_att_masks = self.embed_prefix(images, img_masks, lang_tokens, lang_masks)
         suffix_embs, suffix_pad_masks, suffix_att_masks, adarms_cond = self.embed_suffix(state, x_t, time)
-        if (
-            self.paligemma_with_expert.paligemma.language_model.layers[0].self_attn.q_proj.weight.dtype
-            == torch.bfloat16
-        ):
+        if self._is_gemma4:
+            first_layer = self.paligemma_with_expert.gemma4_vlm.model.layers[0]
+        else:
+            first_layer = self.paligemma_with_expert.paligemma.language_model.layers[0]
+        if first_layer.self_attn.q_proj.weight.dtype == torch.bfloat16:
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
@@ -343,8 +460,12 @@ class PI0Pytorch(nn.Module):
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1
 
-        # Prepare attention masks
-        att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
+        # Prepare attention masks (Gemma 4 needs dual masks: full + sliding window)
+        if self._is_gemma4:
+            sliding_window = self.paligemma_with_expert.gemma4_vlm.model.config.sliding_window
+            att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(att_2d_masks, sliding_window)
+        else:
+            att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
         # Apply gradient checkpointing if enabled
         def forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond):
@@ -388,8 +509,12 @@ class PI0Pytorch(nn.Module):
         prefix_position_ids = torch.cumsum(prefix_pad_masks, dim=1) - 1
 
         # Compute image and language key value cache
-        prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
-        self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
+        if self._is_gemma4:
+            sliding_window = self.paligemma_with_expert.gemma4_vlm.model.config.sliding_window
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(prefix_att_2d_masks, sliding_window)
+        else:
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
+            self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
         _, past_key_values = self.paligemma_with_expert.forward(
             attention_mask=prefix_att_2d_masks_4d,
@@ -444,8 +569,12 @@ class PI0Pytorch(nn.Module):
         position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
         # Prepare attention masks
-        full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
-        self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+        if self._is_gemma4:
+            sliding_window = self.paligemma_with_expert.gemma4_vlm.model.config.sliding_window
+            full_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(full_att_2d_masks, sliding_window)
+        else:
+            full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
+            self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
         outputs_embeds, _ = self.paligemma_with_expert.forward(
             attention_mask=full_att_2d_masks_4d,

@@ -1,14 +1,15 @@
 """RL fine-tuning package for ACoT-VLA.
 
 Implements GRPO (Group Relative Policy Optimization) for flow-matching VLA models,
-adapted from SimpleVLA-RL's approach for JAX/Flax.
+adapted from SimpleVLA-RL's approach.
 
 Key modules:
 - rl_config: Configuration dataclasses
 - grpo_algo: GRPO algorithm (advantage estimation, policy loss)
 - env_runner: Environment rollout collection
 - reward_manager: Reward computation
-- train: Main training loop
+- train: Main training loop (JAX/Flax)
+- train_pytorch: Main training loop (PyTorch with DDP)
 """
 
 from .env_runner import EnvRunner

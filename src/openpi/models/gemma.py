@@ -49,10 +49,21 @@ class Config:
     num_heads: int
     num_kv_heads: int
     head_dim: int
+    global_head_dim: int | None = None  # For Gemma 4 dual head_dim (sliding vs full attention)
     lora_configs: dict[str, lora.LoRAConfig] = dataclasses.field(default_factory=dict)
 
 
-Variant = Literal["dummy", "gemma_300m", "gemma_300m_lora", "gemma_2b", "gemma_2b_lora"]
+Variant = Literal[
+    "dummy",
+    "gemma_300m",
+    "gemma_300m_lora",
+    "gemma_2b",
+    "gemma_2b_lora",
+    "gemma4_300m",
+    "gemma4_300m_lora",
+    "gemma4_2b",
+    "gemma4_2b_lora",
+]
 
 
 def get_config(variant: Variant) -> Config:
@@ -105,6 +116,54 @@ def get_config(variant: Variant) -> Config:
             num_kv_heads=1,
             head_dim=256,
             lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
+        )
+    if variant == "gemma4_300m":
+        # Gemma 4 architecture action expert (~300M params)
+        # 5:1 sliding/full attention pattern, dual RoPE, Q/K/V norms, layer_scalar
+        return Config(
+            width=1024,
+            depth=18,
+            mlp_dim=4096,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            global_head_dim=256,
+        )
+    if variant == "gemma4_2b":
+        # Gemma 4 architecture VLM (~2B params, matches Gemma4TextConfig defaults)
+        # 5:1 sliding/full attention pattern, dual RoPE, Q/K/V norms, layer_scalar
+        return Config(
+            width=2304,
+            depth=30,
+            mlp_dim=9216,
+            num_heads=8,
+            num_kv_heads=4,
+            head_dim=256,
+            global_head_dim=256,
+        )
+    if variant == "gemma4_300m_lora":
+        # Gemma 4 action expert with LoRA
+        return Config(
+            width=1024,
+            depth=18,
+            mlp_dim=4096,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            global_head_dim=256,
+            lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
+        )
+    if variant == "gemma4_2b_lora":
+        # Gemma 4 VLM with LoRA
+        return Config(
+            width=2304,
+            depth=30,
+            mlp_dim=9216,
+            num_heads=8,
+            num_kv_heads=4,
+            head_dim=256,
+            global_head_dim=256,
+            lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
         )
     raise ValueError(f"Unknown variant: {variant}")
 

@@ -1223,6 +1223,126 @@ _CONFIGS = [
         wandb_enabled=False,
     ),
     #
+    # Gemma 4 configs. Uses Gemma 4 architecture (dual RoPE, Q/K/V norms, layer_scalar).
+    # Requires: (1) HuggingFace Gemma 4 pretrained weights loaded via load_gemma4_hf_weights.py
+    #           (2) pytorch_weight_path set to the converted checkpoint path
+    # Example:
+    #   python examples/load_gemma4_hf_weights.py \
+    #       --config_name pi0_aloha_sim_gemma4 \
+    #       --output_path ./checkpoints/gemma4_base_pytorch \
+    #       --vlm_model_id google/gemma-4-2b-pt \
+    #       --vision_model_id google/paligemma-3b-mix-448
+    #   python scripts/train_pytorch.py pi0_aloha_sim_gemma4 --exp_name gemma4_test
+    #
+    TrainConfig(
+        name="pi0_aloha_sim_gemma4",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma4_2b",
+            action_expert_variant="gemma4_300m",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        # Set pytorch_weight_path to the output of load_gemma4_hf_weights.py
+        # pytorch_weight_path="./checkpoints/gemma4_base_pytorch",
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi0_libero_gemma4",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma4_2b",
+            action_expert_variant="gemma4_300m",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        # Set pytorch_weight_path to the output of load_gemma4_hf_weights.py
+        # pytorch_weight_path="./checkpoints/gemma4_base_pytorch",
+        num_train_steps=30_000,
+        batch_size=32,
+    ),
+    TrainConfig(
+        name="pi05_libero_gemma4",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma4_2b",
+            action_expert_variant="gemma4_300m",
+            pi05=True,
+            action_horizon=10,
+            discrete_state_input=False,
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=False,
+        ),
+        # Set pytorch_weight_path to the output of load_gemma4_hf_weights.py
+        # pytorch_weight_path="./checkpoints/gemma4_base_pytorch",
+        num_train_steps=30_000,
+        batch_size=256,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=10_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
+    ),
+    #
+    # Gemma 4 LoRA fine-tuning configs.
+    #
+    TrainConfig(
+        name="pi0_libero_gemma4_lora",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma4_2b_lora",
+            action_expert_variant="gemma4_300m_lora",
+        ),
+        data=LeRobotLiberoDataConfig(
+            repo_id="physical-intelligence/libero",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        # Set pytorch_weight_path to the output of load_gemma4_hf_weights.py
+        # pytorch_weight_path="./checkpoints/gemma4_base_pytorch",
+        num_train_steps=30_000,
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3e-4,
+            decay_steps=30_000,
+            decay_lr=1e-5,
+        ),
+        ema_decay=None,
+    ),
+    TrainConfig(
+        name="pi0_aloha_sim_gemma4_lora",
+        model=pi0_config.Pi0Config(
+            paligemma_variant="gemma4_2b_lora",
+            action_expert_variant="gemma4_300m_lora",
+        ),
+        data=LeRobotAlohaDataConfig(
+            repo_id="lerobot/aloha_sim_transfer_cube_human",
+            default_prompt="Transfer cube",
+            use_delta_joint_actions=False,
+        ),
+        # Set pytorch_weight_path to the output of load_gemma4_hf_weights.py
+        # pytorch_weight_path="./checkpoints/gemma4_base_pytorch",
+        num_train_steps=20_000,
+        batch_size=64,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=3e-4,
+            decay_steps=20_000,
+            decay_lr=1e-5,
+        ),
+        ema_decay=None,
+    ),
+    #
     # Debugging configs.
     #
     TrainConfig(
@@ -1343,7 +1463,7 @@ _CONFIGS = [
             action_dim=19,
             action_horizon=1,
             paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
+            # action_expert_variant="gemma_300m_lora",
         ),
         data=GfootballDataConfig(
             repo_id="gfootball_5v5_dataset",
@@ -1364,7 +1484,6 @@ _CONFIGS = [
             action_dim=19,
             action_horizon=1,
             paligemma_variant="gemma_2b_lora",
-            action_expert_variant="gemma_300m_lora",
         ).get_freeze_filter(),
         ema_decay=None,
     ),
@@ -1438,7 +1557,7 @@ _CONFIGS = [
             action_dim=19,
             action_horizon=1,
             paligemma_variant="dummy",
-            action_expert_variant="dummy",
+            # action_expert_variant="dummy",
         ),
         data=FakeDataConfig(),
         batch_size=2,
