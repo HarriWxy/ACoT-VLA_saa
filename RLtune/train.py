@@ -26,10 +26,19 @@ from __future__ import annotations
 import dataclasses
 import functools
 import logging
+import os
 import pathlib
 import platform
+import sys
 import time
 from typing import Any
+
+# Ensure project root is in sys.path so 'RLtune' can be imported
+# regardless of whether we run as `python -m RLtune.train`
+# or `python RLtune/train.py`.
+_PROJECT_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import flax.nnx as nnx
 import flax.traverse_util as traverse_util
@@ -49,12 +58,12 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
-from .env_runner import EnvRunner
-from .env_runner import compute_rollout_metrics
-from .grpo_algo import compute_advantages
-from .grpo_algo import filter_by_accuracy
-from .reward_manager import create_reward_manager
-from .rl_config import GRPOConfig
+from RLtune.env_runner import EnvRunner
+from RLtune.env_runner import compute_rollout_metrics
+from RLtune.grpo_algo import compute_advantages
+from RLtune.grpo_algo import filter_by_accuracy
+from RLtune.reward_manager import create_reward_manager
+from RLtune.rl_config import GRPOConfig
 
 # ---------------------------------------------------------------------------
 # Logging setup

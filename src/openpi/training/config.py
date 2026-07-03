@@ -1124,6 +1124,36 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False,
                     paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",).get_freeze_filter()
     ),
+    TrainConfig(
+        name="srb_train_gemma4",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=16, discrete_state_input=False,
+            paligemma_variant="gemma4_e2b_lora",
+            action_expert_variant="gemma4_300m_lora",
+            gemma4_model_path="./models/gemma-4-E2B",
+        ),
+        data=SRBDataConfig(
+            repo_id="srb_dataset",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            action_dim=7,
+            observation_keys=("observation.state",),
+            image_keys=("observation.images.image_base", "observation.images.image_wrist"),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=20,
+        batch_size=32,
+        exp_name="srb_sample",
+        save_interval=100,
+        overwrite=True,
+        wandb_enabled=False,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=16, discrete_state_input=False,
+            paligemma_variant="gemma4_e2b_lora",
+            action_expert_variant="gemma4_300m_lora",
+            gemma4_model_path="./models/gemma-4-E2B",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
     #
     # Single-step pi0.5 configs (no diffusion, direct action prediction).
     #
@@ -1230,15 +1260,15 @@ _CONFIGS = [
     #   python examples/load_gemma4_hf_weights.py \
     #       --config_name pi0_aloha_sim_gemma4 \
     #       --output_path ./checkpoints/gemma4_base_pytorch \
-    #       --vlm_model_id google/gemma-4-2b-pt \
-    #       --vision_model_id google/paligemma-3b-mix-448
+    #       --vlm_model_id ./models/gemma-4-E2B
     #   python scripts/train_pytorch.py pi0_aloha_sim_gemma4 --exp_name gemma4_test
     #
     TrainConfig(
         name="pi0_aloha_sim_gemma4",
         model=pi0_config.Pi0Config(
-            paligemma_variant="gemma4_2b",
+            paligemma_variant="gemma4_e2b",
             action_expert_variant="gemma4_300m",
+            gemma4_model_path="./models/gemma-4-E2B",
         ),
         data=LeRobotAlohaDataConfig(
             repo_id="lerobot/aloha_sim_transfer_cube_human",
@@ -1253,8 +1283,9 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_libero_gemma4",
         model=pi0_config.Pi0Config(
-            paligemma_variant="gemma4_2b",
-            action_expert_variant="gemma4_300m",
+            paligemma_variant="gemma4_e2b",
+            action_expert_variant="srb_train",
+            gemma4_model_path="./models/gemma-4-E2B",
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -1269,8 +1300,9 @@ _CONFIGS = [
     TrainConfig(
         name="pi05_libero_gemma4",
         model=pi0_config.Pi0Config(
-            paligemma_variant="gemma4_2b",
+            paligemma_variant="gemma4_e2b",
             action_expert_variant="gemma4_300m",
+            gemma4_model_path="./models/gemma-4-E2B",
             pi05=True,
             action_horizon=10,
             discrete_state_input=False,
@@ -1299,8 +1331,9 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_libero_gemma4_lora",
         model=pi0_config.Pi0Config(
-            paligemma_variant="gemma4_2b_lora",
+            paligemma_variant="gemma4_e2b_lora",
             action_expert_variant="gemma4_300m_lora",
+            gemma4_model_path="./models/gemma-4-E2B",
         ),
         data=LeRobotLiberoDataConfig(
             repo_id="physical-intelligence/libero",
@@ -1322,8 +1355,9 @@ _CONFIGS = [
     TrainConfig(
         name="pi0_aloha_sim_gemma4_lora",
         model=pi0_config.Pi0Config(
-            paligemma_variant="gemma4_2b_lora",
+            paligemma_variant="gemma4_e2b_lora",
             action_expert_variant="gemma4_300m_lora",
+            gemma4_model_path="./models/gemma-4-E2B",
         ),
         data=LeRobotAlohaDataConfig(
             repo_id="lerobot/aloha_sim_transfer_cube_human",

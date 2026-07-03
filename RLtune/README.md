@@ -123,3 +123,331 @@ class MyRewardManager(DenseRewardManager):
 ### 使用不同模型
 
 修改 `train.py` 中的 `init_train_state` 函数以加载不同模型架构。
+
+
+让我先了解一下项目的 RL 微调流程和配置。 
+
+
+---
+
+## 新环境 RL 微调完整流程
+
+### 整体架构
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    RL 微调流程 (GRPO)                            │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                 │
+│  ┌──────────────┐    WebSocket     ┌──────────────────┐        │
+│  │  环境 (Env)   │ ◄────────────►  │  Policy Server    │        │
+│  │  你的新环境    │    obs/action   │  (模型推理)       │        │
+│  └──────┬───────┘                  └──────────────────┘        │
+│         │                                                       │
+│         ▼                                                       │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐      │
+│  │ EnvRunner    │───►│ RewardManager│───►│ GRPO Algo    │      │
+│  │ 收集轨迹       │    │ 计算奖励      │    │ 计算优势      │      │
+│  └──────────────┘    └──────────────┘    └──────┬───────┘      │
+│                                                 │               │
+│                                                 ▼               │
+│                                        ┌──────────────┐        │
+│                                        │ Policy Update│        │
+│                                        │ 优势加权损失   │        │
+│                                        └──────────────┘        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 需要修改/创建的组件
+
+| 组件 | 文件 | 说明 |
+|------|------|------|
+| 1. 训练配置 | config.py | 添加新环境的 `TrainConfig` |
+| 2. 数据变换 | `src/openpi/policies/你的环境_policy.py` | 定义输入/输出变换 |
+| 3. norm_stats | `assets/你的配置名/` | 计算归一化统计量 |
+| 4. 环境 Runner | env_runner.py | 适配新环境的 `_create_env` |
+| 5. 奖励函数 | reward_manager.py | 可能需要自定义奖励 |
+| 6. Policy Server | `examples/你的环境/serve.py` | 启动模型服务 |
+
+---
+
+### Step 1: 准备数据集 (LeRobot 格式)
+
+你的数据集需要是 LeRobot 格式，结构如下：
+
+```
+dataset/你的数据集/
+├── meta/
+│   └── info.json           # 数据集元信息
+└── data/
+    └── chunk-000/
+        ├── episode_000000.parquet
+        ├── episode_000001.parquet
+        └── ...
+```
+
+每个 parquet 文件包含：
+- `observation.images.image_base` — 基座相机图像
+- `observation.images.image_wrist` — 腕部相机图像 (可选)
+- `observation.state` — 本体感受状态 (关节角度等)
+- `action` — 动作标签
+- `episode_index` — episode 编号
+- `frame_index` — 帧编号
+
+### Step 2: 创建数据变换 (Policy Transform)
+
+创建 `src/openpi/policies/你的环境_policy.py`：
+
+```python
+"""数据变换 for 你的环境."""
+
+import numpy as np
+from openpi import transforms as _transforms
+from openpi.models import model as _model
+
+class YourEnvInputs(_transforms.DataTransformFn):
+    """将环境观测转换为模型输入."""
+    
+    def __init__(self, action_dim: int, model_type: _model.ModelType,
+                 observation_keys: tuple[str, ...] = ("observation.state",),
+                 image_keys: tuple[str, ...] = ("observation.images.image_base",)):
+        self.action_dim = action_dim
+        self.model_type = model_type
+        self.observation_keys = observation_keys
+        self.image_keys = image_keys
+    
+    def __call__(self, x: dict) -> dict:
+        # 处理 state
+        state = np.concatenate([np.asarray(x[k]).flatten() for k in self.observation_keys])
+        # 填充或截断到模型期望的维度
+        if len(state) < 32:  # 模型内部状态维度
+            state = np.concatenate([state, np.zeros(32 - len(state))])
+        else:
+            state = state[:32]
+        
+        result = {"state": state.astype(np.float32)}
+        
+        # 处理图像
+        for i, img_key in enumerate(self.image_keys):
+            if img_key in x:
+                result[f"image_{i}"] = np.asarray(x[img_key])
+        
+        # 处理 action (训练时)
+        if "action" in x:
+            action = np.asarray(x["action"]).flatten()
+            if len(action) < self.action_dim:
+                action = np.concatenate([action, np.zeros(self.action_dim - len(action))])
+            else:
+                action = action[:self.action_dim]
+            result["actions"] = action.astype(np.float32)
+        
+        return result
+
+
+class YourEnvOutputs(_transforms.DataTransformFn):
+    """将模型输出转换为环境动作."""
+    
+    def __init__(self, action_dim: int = 7):
+        self.action_dim = action_dim
+    
+    def __call__(self, x: dict) -> dict:
+        actions = np.asarray(x["actions"])
+        # 截断到环境期望的维度
+        if actions.ndim == 2:
+            actions = actions[:, :self.action_dim]
+        else:
+            actions = actions[:self.action_dim]
+        return {"actions": actions}
+```
+
+### Step 3: 添加训练配置
+
+在 config.py 的 `_CONFIGS` 列表中添加：
+
+```python
+TrainConfig(
+    name="your_env_train",  # 配置名称，CLI 使用
+    model=pi0_config.Pi0Config(
+        pi05=True,  # 使用 PI0.5 (quantile 归一化)
+        action_horizon=16,
+        action_dim=7,  # 你的环境动作维度
+        paligemma_variant="gemma_2b_lora",  # 或 "gemma_4_e2b" 如果用 Gemma 4
+        action_expert_variant="gemma_300m_lora",
+    ),
+    data=SRBDataConfig(  # 或自定义 DataConfigFactory
+        repo_id="你的数据集名称",  # dataset/ 下的文件夹名
+        base_config=DataConfig(
+            prompt_from_task=True,
+            action_sequence_keys=("action",),
+        ),
+        action_dim=7,
+        observation_keys=("observation.state",),
+        image_keys=("observation.images.image_base",),
+    ),
+    weight_loader=weight_loaders.CheckpointWeightLoader(
+        "gs://openpi-assets/checkpoints/pi05_base/params"  # 预训练权重
+    ),
+    num_train_steps=20_000,
+    batch_size=32,
+    exp_name="your_experiment",
+    wandb_enabled=True,
+)
+```
+
+### Step 4: 计算 norm_stats
+
+```bash
+# 计算归一化统计量
+uv run python scripts/compute_norm_stats.py --config-name your_env_train
+```
+
+这会生成 `assets/your_env_train/你的数据集名称/norm_stats.json`。
+
+### Step 5: SFT 预训练 (先用演示数据微调)
+
+```bash
+# 单卡
+uv run python scripts/train.py --config_name your_env_train
+
+# 多卡
+bash scripts/train.sh your_env_train your_experiment
+```
+
+### Step 6: 适配环境 Runner
+
+修改 env_runner.py 中的 `_create_env` 方法，或创建新的环境适配器：
+
+```python
+def _create_env(self, seed: int = 0):
+    """创建你的环境."""
+    import gymnasium  # 或你的环境库
+    
+    # 方式1: 直接使用 Gymnasium 环境
+    env = gymnasium.make(
+        "YourEnv-v1",
+        render_mode="rgb_array" if self.env_config.enable_cameras else None,
+        seed=seed,
+    )
+    
+    # 方式2: 使用自定义环境
+    # from your_env import YourEnv
+    # env = YourEnv(seed=seed, headless=self.env_config.headless)
+    
+    task_description = self.env_config.prompt
+    return env, task_description
+```
+
+**关键**: 环境需要实现标准 Gymnasium 接口：
+- `env.reset()` → `(obs, info)`
+- `env.step(action)` → `(obs, reward, terminated, truncated, info)`
+- `info` 中需要包含 `"success"` 或 `"is_success"` 字段
+
+### Step 7: 启动 Policy Server
+
+创建 `examples/你的环境/serve.py`：
+
+```python
+import dataclasses
+import tyro
+from openpi.policies import policy_config as _policy_config
+from openpi.training import config as _config
+from openpi.serving import websocket_policy_server_sample as wps_sample
+
+@dataclasses.dataclass
+class Args:
+    config_name: str = "your_env_train"
+    checkpoint_dir: str = "checkpoints/your_env_train/your_experiment"
+    host: str = "0.0.0.0"
+    port: int = 8899
+    default_prompt: str = "完成任务"
+
+def main(args: Args):
+    train_config = _config.get_config(args.config_name)
+    policy = _policy_config.create_trained_policy(
+        train_config, args.checkpoint_dir,
+        default_prompt=args.default_prompt,
+    )
+    server = wps_sample.WebsocketPolicyServerSample(
+        policy=policy, host=args.host, port=args.port,
+    )
+    server.serve_forever()
+
+if __name__ == "__main__":
+    main(tyro.cli(Args))
+```
+
+### Step 8: 运行 RL 微调
+
+```bash
+# 终端 1: 启动 Policy Server
+python -m examples.your_env.serve \
+    --config_name your_env_train \
+    --checkpoint_dir checkpoints/your_env_train/your_experiment
+
+# 终端 2: 运行 RL 训练
+python -m RLtune.train_pytorch \
+    --config_name your_env_train \
+    --checkpoint_dir checkpoints/your_env_train/your_experiment \
+    --env_id "你的环境ID" \
+    --default_prompt "完成任务" \
+    --n_samples 8 \
+    --total_epochs 100 \
+    --learning_rate 5e-6
+
+# 或使用启动脚本
+bash RLtune/run_rl_train_pytorch.sh your_env_train \
+    checkpoints/your_env_train/your_experiment
+```
+
+### Step 9: 自定义奖励 (可选)
+
+如果需要更复杂的奖励函数，修改 reward_manager.py：
+
+```python
+class YourEnvRewardManager:
+    def compute_rewards(self, trajectories):
+        rewards = []
+        for traj in trajectories:
+            # 自定义奖励逻辑
+            if traj.success:
+                reward = 1.0
+                # 可选: 长度奖励 (越短越好)
+                reward += 0.1 * (1.0 - traj.episode_length / self.max_steps)
+            else:
+                reward = 0.0
+            rewards.append(reward)
+        return np.array(rewards), {"success_rate": np.mean([t.success for t in trajectories])}
+```
+
+---
+
+## 如果使用 Gemma 4 E2B
+
+Gemma 4 只是改了 backbone，流程完全一样：
+
+```python
+# 在 config.py 中修改模型配置
+model=pi0_config.Pi0Config(
+    pi05=True,
+    paligemma_variant="gemma_4_e2b",  # ← 改这里
+    action_expert_variant="gemma_300m_lora",
+    # 如果需要指定本地模型路径
+    # gemma4_model_path="./models/gemma-4-E2B",
+)
+```
+
+**norm_stats 不变** — 它只依赖数据集，不依赖模型。
+
+---
+
+## 快速检查清单
+
+- [ ] 数据集转为 LeRobot 格式
+- [ ] 创建 `你的环境_policy.py` 数据变换
+- [ ] 在 config.py 添加 `TrainConfig`
+- [ ] 运行 compute_norm_stats.py
+- [ ] SFT 预训练得到初始 checkpoint
+- [ ] 实现环境 Gymnasium 接口
+- [ ] 创建 serve.py 启动脚本
+- [ ] 修改 env_runner.py 的 `_create_env`
+- [ ] 运行 RL 微调

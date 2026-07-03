@@ -63,6 +63,8 @@ Variant = Literal[
     "gemma4_300m_lora",
     "gemma4_2b",
     "gemma4_2b_lora",
+    "gemma4_e2b",
+    "gemma4_e2b_lora",
 ]
 
 
@@ -161,6 +163,30 @@ def get_config(variant: Variant) -> Config:
             mlp_dim=9216,
             num_heads=8,
             num_kv_heads=4,
+            head_dim=256,
+            global_head_dim=256,
+            lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
+        )
+    if variant == "gemma4_e2b":
+        # Gemma 4 E2B (~2B params, matches gemma-4-E2B checkpoint)
+        # hidden_size=1536, num_hidden_layers=35, intermediate_size=6144
+        return Config(
+            width=1536,
+            depth=35,
+            mlp_dim=6144,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            global_head_dim=256,
+        )
+    if variant == "gemma4_e2b_lora":
+        # Gemma 4 E2B with LoRA
+        return Config(
+            width=1536,
+            depth=35,
+            mlp_dim=6144,
+            num_heads=8,
+            num_kv_heads=1,
             head_dim=256,
             global_head_dim=256,
             lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},

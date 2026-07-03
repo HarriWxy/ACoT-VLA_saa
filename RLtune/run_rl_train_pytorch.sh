@@ -61,7 +61,7 @@ fi
 
 # ── Print header ──
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║      ACoT-VLA RL Fine-tuning (GRPO) — PyTorch              ║"
+echo "║      ACoT-VLA RL Fine-tuning (GRPO) — PyTorch                ║"
 echo "╠══════════════════════════════════════════════════════════════╣"
 echo "║  Config:     ${CONFIG_NAME}"
 echo "║  Checkpoint: ${CHECKPOINT_DIR:-'auto'}"

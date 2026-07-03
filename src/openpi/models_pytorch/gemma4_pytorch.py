@@ -1,7 +1,10 @@
-"""PaliGemma4 + Expert Model for PI0 robotics policy.
+"""Gemma4 + Expert Model for PI0 robotics policy.
 
-Uses Gemma 4 architecture (dual head_dim, dual RoPE, PLE, layer_scalar)
-with PaliGemma's SigLIP vision tower for visual processing.
+Uses Gemma 4 native multimodal architecture:
+- Gemma4VisionModel + Gemma4MultimodalEmbedder for visual processing
+  (replaces PaliGemma's SigLIP vision tower)
+- Gemma4TextModel for VLM language model
+- Gemma4TextModel as action expert (shares attention with VLM)
 
 Key differences from Gemma 2 based gemma_pytorch.py:
 - 4 LayerNorms per layer (input, post_attn, pre_ffn, post_ffn) + layer_scalar
@@ -21,10 +24,29 @@ from typing import Literal
 
 import torch
 from torch import nn
+from transformers import AutoImageProcessor
 from transformers import Gemma4ForCausalLM
-from transformers import PaliGemmaForConditionalGeneration
+from transformers import Gemma4ForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma4.modeling_gemma4 import repeat_kv
+import numpy as np
+from PIL import Image
+
+
+def _make_layer_types(num_layers: int, pattern: int = 6) -> list[str]:
+    """Generate Gemma4 layer_types with last layer forced to full_attention.
+
+    Args:
+        num_layers: Total number of decoder layers.
+        pattern: Sliding window pattern period (default 6 → 5:1 sliding:full).
+    """
+    layer_types = [
+        "sliding_attention" if ((i + 1) % pattern) != 0 else "full_attention"
+        for i in range(num_layers)
+    ]
+    # Ensure last layer is full_attention (required by Gemma4)
+    layer_types[-1] = "full_attention"
+    return layer_types
 
 
 def _enable_adarms_on_layer(layer, cond_dim: int):
@@ -80,12 +102,13 @@ def _gated_residual(x, y, gate):
     return x + y * gate
 
 
-class PaliGemma4WithExpertModel(nn.Module):
-    """PaliGemma4 with joint attention expert model.
+class Gemma4WithExpertModel(nn.Module):
+    """Gemma-4 native multimodal + action expert model.
 
     Architecture:
-    - VLM: PaliGemma (SigLIP vision tower + Gemma4 language model)
-    - Action Expert: Gemma4 (smaller, shares attention with VLM)
+    - VLM: Gemma-4 text decoder (native, no PaliGemma dependency)
+    - Vision: Gemma-4 VisionModel + MultimodalEmbedder (replaces SigLIP)
+    - Action Expert: Gemma-4 text decoder (smaller, shares joint attention with VLM)
 
     Joint attention: Q/K/V from both models are concatenated along the
     sequence dimension, with RoPE applied per-model based on layer_type,
@@ -98,6 +121,7 @@ class PaliGemma4WithExpertModel(nn.Module):
         action_expert_config,
         use_adarms=None,
         precision: Literal["bfloat16", "float32"] = "bfloat16",
+        gemma4_model_path: str = None,
     ):
         if use_adarms is None:
             use_adarms = [False, False]
@@ -107,45 +131,32 @@ class PaliGemma4WithExpertModel(nn.Module):
 
         self.use_adarms = use_adarms
 
-        # --- PaliGemma VLM config (vision tower + Gemma2 placeholder language model) ---
-        vlm_config_hf = CONFIG_MAPPING["paligemma"]()
-        vlm_config_hf._vocab_size = 257152  # noqa: SLF001
-        vlm_config_hf.image_token_index = 257152
-        # Vision config (SigLIP)
-        vlm_config_hf.vision_config.intermediate_size = 4304
-        vlm_config_hf.vision_config.projection_dim = vlm_config.width  # Match Gemma4 hidden_size
-        vlm_config_hf.vision_config.projector_hidden_act = "gelu_fast"
-        vlm_config_hf.vision_config.dtype = "float32"
-        # Text config (Gemma2 placeholder — will be replaced with Gemma4)
-        vlm_config_hf.text_config.hidden_size = vlm_config.width
-        vlm_config_hf.text_config.intermediate_size = vlm_config.mlp_dim
-        vlm_config_hf.text_config.num_attention_heads = vlm_config.num_heads
-        vlm_config_hf.text_config.head_dim = vlm_config.head_dim
-        vlm_config_hf.text_config.num_hidden_layers = vlm_config.depth
-        vlm_config_hf.text_config.num_key_value_heads = vlm_config.num_kv_heads
-        vlm_config_hf.text_config.hidden_activation = "gelu_pytorch_tanh"
-        vlm_config_hf.text_config.dtype = "float32"
-        vlm_config_hf.text_config.vocab_size = 257152
+        # --- Load native Gemma-4 vision components from pretrained checkpoint ---
+        if gemma4_model_path is None:
+            raise ValueError(
+                "gemma4_model_path is required. Pass the path to the Gemma-4 "
+                "checkpoint (e.g. './models/gemma-4-E2B') to load the native "
+                "vision tower and multimodal embedder."
+            )
 
-        # --- Action expert Gemma4 config ---
-        action_expert_config_hf = CONFIG_MAPPING["gemma4_text"](
-            hidden_size=action_expert_config.width,
-            intermediate_size=action_expert_config.mlp_dim,
-            num_attention_heads=action_expert_config.num_heads,
-            num_hidden_layers=action_expert_config.depth,
-            num_key_value_heads=action_expert_config.num_kv_heads,
-            head_dim=action_expert_config.head_dim,
-            global_head_dim=action_expert_config.head_dim,
-            vocab_size=257152,
-            hidden_activation="gelu_pytorch_tanh",
-            dtype="float32",
-            hidden_size_per_layer_input=0,  # Disable PLE for action expert
+        logging.info(f"Loading Gemma-4 vision components from {gemma4_model_path}...")
+        full_model = Gemma4ForConditionalGeneration.from_pretrained(
+            gemma4_model_path, dtype=torch.bfloat16
         )
+        # Extract native vision components (correct path: model.model.*)
+        self.vision_tower = full_model.model.vision_tower       # Gemma4VisionModel
+        self.embed_vision = full_model.model.embed_vision       # Gemma4MultimodalEmbedder (768→1536)
+        self.image_processor = AutoImageProcessor.from_pretrained(gemma4_model_path)
+        # Store soft tokens count (typically 256 for 224x224 images with patch=16)
+        self._num_soft_tokens = full_model.config.vision_soft_tokens_per_image  # 256
 
-        # --- Create VLM with SigLIP vision tower ---
-        self.paligemma = PaliGemmaForConditionalGeneration(config=vlm_config_hf)
+        # Extract language model embedding from the pretrained model
+        pretrained_embed = full_model.model.language_model.embed_tokens
+        logging.info(f"  Extracted vision_tower, embed_vision, image_processor (soft_tokens={self._num_soft_tokens})")
 
-        # --- Replace Gemma2 language model with Gemma4 ---
+        del full_model  # Free the full model (keep only vision + embed)
+
+        # --- VLM text decoder ---
         vlm_text_config = CONFIG_MAPPING["gemma4_text"](
             hidden_size=vlm_config.width,
             intermediate_size=vlm_config.mlp_dim,
@@ -154,16 +165,32 @@ class PaliGemma4WithExpertModel(nn.Module):
             num_key_value_heads=vlm_config.num_kv_heads,
             head_dim=vlm_config.head_dim,
             global_head_dim=vlm_config.head_dim,
-            vocab_size=257152,
+            vocab_size=262144,
             hidden_activation="gelu_pytorch_tanh",
             dtype="float32",
             hidden_size_per_layer_input=0,  # Disable PLE for initial integration
+            layer_types=_make_layer_types(vlm_config.depth),
         )
         self.gemma4_vlm = Gemma4ForCausalLM(vlm_text_config)
-        # Share the embedding layer with PaliGemma's token embedding
-        self.gemma4_vlm.model.embed_tokens = self.paligemma.model.language_model.embed_tokens
+        # Use pretrained embedding from Gemma-4 checkpoint
+        self.gemma4_vlm.model.embed_tokens = pretrained_embed
+        logging.info("  Created VLM text decoder with pretrained embedding")
 
-        # --- Create action expert ---
+        # --- Action expert ---
+        action_expert_config_hf = CONFIG_MAPPING["gemma4_text"](
+            hidden_size=action_expert_config.width,
+            intermediate_size=action_expert_config.mlp_dim,
+            num_attention_heads=action_expert_config.num_heads,
+            num_hidden_layers=action_expert_config.depth,
+            num_key_value_heads=action_expert_config.num_kv_heads,
+            head_dim=action_expert_config.head_dim,
+            global_head_dim=action_expert_config.head_dim,
+            vocab_size=262144,
+            hidden_activation="gelu_pytorch_tanh",
+            dtype="float32",
+            hidden_size_per_layer_input=0,  # Disable PLE for action expert
+            layer_types=_make_layer_types(action_expert_config.depth),
+        )
         self.gemma4_expert = Gemma4ForCausalLM(config=action_expert_config_hf)
         self.gemma4_expert.model.embed_tokens = None  # Use VLM embeddings
 
@@ -197,9 +224,9 @@ class PaliGemma4WithExpertModel(nn.Module):
             raise ValueError(f"Invalid precision: {precision}")
 
         params_to_keep_float32 = [
-            "vision_tower.vision_model.embeddings.patch_embedding.weight",
-            "vision_tower.vision_model.embeddings.patch_embedding.bias",
-            "vision_tower.vision_model.embeddings.position_embedding.weight",
+            "vision_tower.embeddings.patch_embedding.weight",
+            "vision_tower.embeddings.patch_embedding.bias",
+            "vision_tower.embeddings.position_embedding.weight",
             "input_layernorm",
             "post_attention_layernorm",
             "pre_feedforward_layernorm",
@@ -243,8 +270,56 @@ class PaliGemma4WithExpertModel(nn.Module):
         logging.info(f"Injected LoRA into {len(injected)} modules")
         return injected
 
-    def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+    def embed_image(self, images) -> torch.Tensor:
+        """Embed images using Gemma-4 native vision encoder.
+
+        Args:
+            images: PIL Image(s) or tensor. If PIL, processed via image_processor.
+                    If tensor of shape (B, C, H, W), assumed already preprocessed.
+
+        Returns:
+            Image embeddings of shape (B, num_tokens, vlm_hidden_size).
+        """
+        if isinstance(images, torch.Tensor):
+            # images is already a tensor: convert to PIL for image_processor
+            # tensor shape: (B, C, H, W), values in [0, 1] or [0, 255]
+            if images.dim() == 4:
+                images_np = images.detach().cpu().to(torch.float32)
+                if images_np.max() <= 1.0:
+                    images_np = images_np * 255.0
+                images_np = images_np.permute(0, 2, 3, 1).numpy().astype(np.uint8)
+                pil_images = [Image.fromarray(img_np) for img_np in images_np]
+            else:
+                raise ValueError(f"Expected 4D tensor (B,C,H,W), got shape {images.shape}")
+        else:
+            # Already PIL Image(s)
+            pil_images = images if isinstance(images, list) else [images]
+
+        # Process through image processor → pixel_values (B, N, 768), position_ids (B, N, 2)
+        inputs = self.image_processor(images=pil_images, return_tensors="pt")
+        pixel_values = inputs["pixel_values"].to(device=self.vision_tower.device, dtype=self.vision_tower.dtype)
+        position_ids = inputs["image_position_ids"].to(device=self.vision_tower.device)
+
+        # Vision tower: (B, N, 768) → output tokens
+        with torch.no_grad():
+            vision_out = self.vision_tower(
+                pixel_values=pixel_values,
+                pixel_position_ids=position_ids,
+            )
+        batch_size = len(pil_images)
+        # The vision tower output may not be batched: handle (N, D) vs (B, N, D)
+        vision_features = vision_out.last_hidden_state
+        if vision_features.dim() == 2:
+            # (N, D) → (B, N, D)
+            vision_features = vision_features.unsqueeze(0).expand(batch_size, -1, -1)
+        elif vision_features.dim() == 3 and vision_features.shape[0] != batch_size:
+            # (B*N, D) → (B, N, D)
+            num_tokens = vision_features.shape[0] // batch_size
+            vision_features = vision_features.reshape(batch_size, num_tokens, -1)
+
+        # Project to VLM hidden size: (B, 256, 768) → (B, 256, 1536)
+        image_embeddings = self.embed_vision(inputs_embeds=vision_features)
+        return image_embeddings
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.gemma4_vlm.model.embed_tokens(tokens)
@@ -414,7 +489,7 @@ class PaliGemma4WithExpertModel(nn.Module):
             att_output = att_output.transpose(1, 2).contiguous()
 
             head_dim = vlm_layer.self_attn.head_dim
-            att_output = att_output.reshape(batch_size, -1, 1 * 8 * head_dim)
+            att_output = att_output.reshape(batch_size, -1, num_q_heads * head_dim)
 
             # Split output back to each model
             vlm_seq_len = vlm_hidden.shape[1]

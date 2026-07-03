@@ -2,24 +2,21 @@
 """
 Load HuggingFace Gemma 4 pretrained weights into PI0Pytorch model.
 
-This script loads pretrained Gemma 4 language model weights from HuggingFace
-and SigLIP vision tower weights from PaliGemma into the PI0Pytorch model,
-then saves as a safetensors checkpoint that can be used by train_pytorch.py.
+This script loads pretrained Gemma 4 language model weights from a local
+or HuggingFace checkpoint into the PI0Pytorch model. The vision tower
+and multimodal embedder are loaded automatically by Gemma4WithExpertModel
+from the same checkpoint during __init__.
 
 Usage:
-    # Load Gemma 4 2B VLM + random action expert, save as PyTorch checkpoint
+    # Load Gemma 4 E2B VLM + random action expert, save as PyTorch checkpoint
     python examples/load_gemma4_hf_weights.py \
         --config_name pi0_aloha_sim_gemma4 \
-        --output_path /path/to/gemma4_pytorch_ckpt \
-        --vlm_model_id google/gemma-4-2b-pt \
-        --vision_model_id google/paligemma-3b-mix-448
+        --output_path ./checkpoints/gemma4_base_pytorch
 
     # Load with PI05 mode (adarms)
     python examples/load_gemma4_hf_weights.py \
-        --config_name pi05_aloha_gemma4 \
-        --output_path /path/to/gemma4_pi05_pytorch_ckpt \
-        --vlm_model_id google/gemma-4-2b-pt \
-        --vision_model_id google/paligemma-3b-mix-448
+        --config_name pi05_libero_gemma4 \
+        --output_path ./checkpoints/gemma4_pi05_pytorch
 
 Prerequisites:
     pip install transformers>=5.10.1 safetensors huggingface_hub
@@ -27,8 +24,8 @@ Prerequisites:
 Note:
     - The action expert (Gemma4 300M) is randomly initialized since there is
       no pretrained action expert available. Fine-tuning will train it from scratch.
-    - The VLM (Gemma4 2B) weights are loaded from HuggingFace pretrained.
-    - The SigLIP vision tower weights are loaded from a PaliGemma checkpoint.
+    - The VLM + vision tower + multimodal embedder are loaded from the
+      checkpoint specified by `gemma4_model_path` in the training config.
     - After running this script, use the output path as `pytorch_weight_path`
       in your training config.
 """
@@ -40,9 +37,7 @@ import pathlib
 
 import safetensors.torch
 import torch
-from huggingface_hub import snapshot_download
 from transformers import AutoModelForCausalLM
-from transformers import PaliGemmaForConditionalGeneration
 
 import openpi.models_pytorch.pi0_pytorch as pi0_pytorch
 import openpi.training.config as _config
@@ -52,18 +47,21 @@ logger = logging.getLogger(__name__)
 
 # os.environ["HF_ENDPOINT"]= "https://hf-mirror.com"
 
-def load_vlm_weights_into_model(model: pi0_pytorch.PI0Pytorch, vlm_model_id: str, vision_model_id: str):
-    """Load pretrained VLM weights into the PI0Pytorch model.
+def load_vlm_weights_into_model(model: pi0_pytorch.PI0Pytorch, vlm_model_id: str):
+    """Load pretrained VLM language model weights into the PI0Pytorch model.
+
+    The vision tower and multimodal embedder are already loaded by
+    Gemma4WithExpertModel.__init__ from the checkpoint. This function
+    only loads the text decoder weights into gemma4_vlm.
 
     Args:
         model: The PI0Pytorch model to load weights into.
-        vlm_model_id: HuggingFace model ID for Gemma 4 language model.
-        vision_model_id: HuggingFace model ID for PaliGemma vision tower.
+        vlm_model_id: Path or HuggingFace model ID for Gemma 4.
     """
-    paligemma4 = model.paligemma_with_expert
-    assert hasattr(paligemma4, "gemma4_vlm"), "Model must be a Gemma 4 variant"
+    gemma4_with_expert = model.paligemma_with_expert
+    assert hasattr(gemma4_with_expert, "gemma4_vlm"), "Model must be a Gemma 4 variant"
 
-    # --- Step 1: Load Gemma 4 language model weights ---
+    # --- Load Gemma 4 language model weights ---
     logger.info(f"Loading Gemma 4 language model from {vlm_model_id}...")
     hf_gemma4 = AutoModelForCausalLM.from_pretrained(
         vlm_model_id,
@@ -71,55 +69,26 @@ def load_vlm_weights_into_model(model: pi0_pytorch.PI0Pytorch, vlm_model_id: str
         trust_remote_code=True,
     )
 
-    # Map HuggingFace Gemma4 weights to our gemma4_vlm
+    # Map HuggingFace Gemma4 text model weights to our gemma4_vlm
+    # HF keys: "model.layers.0.self_attn.q_proj.weight"
+    # Ours:    "gemma4_vlm.model.layers.0.self_attn.q_proj.weight"
     vlm_state_dict = {}
     hf_state = hf_gemma4.state_dict()
     for key, value in hf_state.items():
-        # HF model keys are like "model.layers.0.self_attn.q_proj.weight"
-        # Our keys are like "gemma4_vlm.model.layers.0.self_attn.q_proj.weight"
         new_key = f"gemma4_vlm.{key}"
         vlm_state_dict[new_key] = value
 
-    # Load into model (strict=False because we only load VLM part)
-    missing, unexpected = paligemma4.load_state_dict(vlm_state_dict, strict=False)
+    # Load into model (strict=False because we only load VLM part, not expert)
+    missing, unexpected = gemma4_with_expert.load_state_dict(vlm_state_dict, strict=False)
     logger.info(f"Loaded Gemma 4 VLM weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
+    if missing:
+        logger.info(f"  Missing keys (first 10): {missing[:10]}")
+    if unexpected:
+        logger.info(f"  Unexpected keys (first 10): {unexpected[:10]}")
 
     # Clean up
     del hf_gemma4
     torch.cuda.empty_cache()
-
-    # --- Step 2: Load SigLIP vision tower weights from PaliGemma ---
-    logger.info(f"Loading SigLIP vision tower from {vision_model_id}...")
-    hf_paligemma = PaliGemmaForConditionalGeneration.from_pretrained(
-        vision_model_id,
-        dtype=torch.float32,
-        trust_remote_code=True,
-    )
-
-    # Map PaliGemma vision tower weights
-    vision_state_dict = {}
-    for key, value in hf_paligemma.state_dict().items():
-        if key.startswith("model.vision_tower."):
-            new_key = f"paligemma.{key}"
-            vision_state_dict[new_key] = value
-        elif key.startswith("model.multi_modal_projector."):
-            new_key = f"paligemma.{key}"
-            vision_state_dict[new_key] = value
-
-    missing, unexpected = paligemma4.load_state_dict(vision_state_dict, strict=False)
-    logger.info(f"Loaded SigLIP vision weights. Missing: {len(missing)}, Unexpected: {len(unexpected)}")
-
-    # Clean up
-    del hf_paligemma
-    torch.cuda.empty_cache()
-
-    # --- Step 3: Also load language model embedding from Gemma 4 ---
-    # The paligemma's language model placeholder shares embed_tokens with gemma4_vlm
-    # We need to copy the embedding weights
-    logger.info("Syncing embedding weights...")
-    paligemma4.paligemma.model.language_model.embed_tokens.weight.data.copy_(
-        paligemma4.gemma4_vlm.model.embed_tokens.weight.data
-    )
 
     return model
 
@@ -130,7 +99,7 @@ def main():
         "--config_name",
         type=str,
         # required=True,
-        default="pi0_libero_gemma4_lora",
+        default="pi05_libero_gemma4",
         help="Training config name (e.g., pi0_aloha_sim_gemma4). Must exist in _CONFIGS.",
     )
     parser.add_argument(
@@ -143,14 +112,8 @@ def main():
     parser.add_argument(
         "--vlm_model_id",
         type=str,
-        default="google/gemma-4-2b-pt",
+        default="./models/gemma-4-E2B",
         help="HuggingFace model ID for Gemma 4 language model.",
-    )
-    parser.add_argument(
-        "--vision_model_id",
-        type=str,
-        default="google/paligemma-3b-mix-448",
-        help="HuggingFace model ID for PaliGemma vision tower.",
     )
     parser.add_argument(
         "--precision",
@@ -168,8 +131,8 @@ def main():
     logger.info(f"Creating PI0Pytorch model with config: {model_cfg}")
     model = pi0_pytorch.PI0Pytorch(model_cfg)
 
-    # Load pretrained weights
-    load_vlm_weights_into_model(model, args.vlm_model_id, args.vision_model_id)
+    # Load pretrained weights (vision tower is loaded automatically in __init__)
+    load_vlm_weights_into_model(model, args.vlm_model_id)
 
     # Convert to target precision
     if args.precision == "bfloat16":

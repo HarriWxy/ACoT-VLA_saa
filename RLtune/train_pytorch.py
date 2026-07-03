@@ -38,8 +38,16 @@ import os
 import pathlib
 import platform
 import shutil
+import sys
 import time
 from typing import Any
+
+# Ensure project root is in sys.path so 'RLtune' can be imported
+# regardless of whether we run as `python -m RLtune.train_pytorch`
+# or `python RLtune/train_pytorch.py`.
+_PROJECT_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
 
 import numpy as np
 import safetensors.torch
@@ -47,7 +55,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 import tqdm
-import wandb
+from torch.utils.tensorboard import SummaryWriter
 
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
@@ -56,12 +64,12 @@ import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 
-from .env_runner import EnvRunner
-from .env_runner import compute_rollout_metrics
-from .grpo_algo import compute_advantages
-from .grpo_algo import filter_by_accuracy
-from .reward_manager import create_reward_manager
-from .rl_config import GRPOConfig
+from RLtune.env_runner import EnvRunner
+from RLtune.env_runner import compute_rollout_metrics
+from RLtune.grpo_algo import compute_advantages
+from RLtune.grpo_algo import filter_by_accuracy
+from RLtune.reward_manager import create_reward_manager
+from RLtune.rl_config import GRPOConfig
 
 # ---------------------------------------------------------------------------
 # Logging setup
@@ -213,39 +221,35 @@ def build_model(config: _config.TrainConfig, device: torch.device) -> torch.nn.M
 
 
 # ---------------------------------------------------------------------------
-# Wandb helpers
+# TensorBoard helpers
 # ---------------------------------------------------------------------------
 
 
-def init_wandb(
+def init_tensorboard(
     rl_config: GRPOConfig,
     base_config: _config.TrainConfig,
     *,
     resuming: bool,
-    enabled: bool = True,
-):
-    """Initialize WandB logging for RL training."""
-    if not enabled:
-        wandb.init(mode="disabled")
-        return
+) -> SummaryWriter:
+    """Initialize TensorBoard logging for RL training.
 
-    ckpt_dir = base_config.checkpoint_dir
-    if not ckpt_dir.exists():
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+    Returns a SummaryWriter instance. Logs are written to
+    ``<checkpoint_dir>/rl_grpo/tensorboard/``.
+    """
+    log_dir = base_config.checkpoint_dir / "rl_grpo" / "tensorboard"
+    log_dir.mkdir(parents=True, exist_ok=True)
 
-    if resuming:
-        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
-        wandb.init(id=run_id, resume="must", project=f"{base_config.project_name}_rl")
-    else:
-        wandb.init(
-            name=f"rl_grpo_{base_config.exp_name}",
-            config={
-                **dataclasses.asdict(rl_config),
-                "base_config": dataclasses.asdict(base_config),
-            },
-            project=f"{base_config.project_name}_rl",
-        )
-        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+    writer = SummaryWriter(log_dir=str(log_dir))
+
+    # Log hyperparameters as text
+    hparams_text = (
+        f"## RL Config\n```json\n{dataclasses.asdict(rl_config)}\n```\n\n"
+        f"## Base Config\n```json\n{dataclasses.asdict(base_config)}\n```"
+    )
+    writer.add_text("hyperparameters", hparams_text)
+
+    logging.info(f"TensorBoard logs -> {log_dir}")
+    return writer
 
 
 # ---------------------------------------------------------------------------
@@ -506,7 +510,7 @@ def train_loop(rl_config: GRPOConfig):
     set_seed(rl_config.seed, local_rank)
 
     # Get base training config
-    base_config = _config.get_config(rl_config.config_name)
+    base_config = _config.get_config(rl_config.config_name)  # srb_train
 
     # Override checkpoint dir if specified
     if rl_config.checkpoint_dir:
@@ -519,15 +523,17 @@ def train_loop(rl_config: GRPOConfig):
     rl_ckpt_dir = base_config.checkpoint_dir / "rl_grpo"
     resuming = rl_ckpt_dir.exists() and any(rl_ckpt_dir.glob("epoch_*"))
 
+    writer = None
     if is_main:
-        init_wandb(rl_config, base_config, resuming=resuming)
+        writer = init_tensorboard(rl_config, base_config, resuming=resuming)
 
     # Build data loader for offline RL (using SFT demonstration data)
     world_size = torch.distributed.get_world_size() if use_ddp else 1
-    loader, data_config = _data_loader.create_data_loader(
+    loader = _data_loader.create_data_loader(
         base_config,
         framework="pytorch",
         shuffle=True,
+        skip_norm_stats=True,
     )
 
     # Build model
@@ -737,7 +743,7 @@ def train_loop(rl_config: GRPOConfig):
                     "lr": f"{optimizer.param_groups[0]['lr']:.2e}",
                 })
 
-            # Log step metrics
+            # Log step metrics to TensorBoard
             if is_main and step % rl_config.log_interval == 0 and step > 0:
                 avg_loss = np.mean([s["rl_loss"] for s in step_losses[-rl_config.log_interval:]])
                 logging.info(
@@ -745,6 +751,13 @@ def train_loop(rl_config: GRPOConfig):
                     f"grad_norm={grad_norm:.4f}, "
                     f"lr={optimizer.param_groups[0]['lr']:.2e}"
                 )
+                # Write step-level scalars to TensorBoard
+                writer.add_scalar("step/rl_loss", avg_loss, global_step)
+                writer.add_scalar("step/grad_norm", grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm, global_step)
+                writer.add_scalar("step/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+                for key, value in step_metrics.items():
+                    if isinstance(value, (int, float)):
+                        writer.add_scalar(f"step/{key}", value, global_step)
 
         # ── Logging ──
         epoch_time = time.time() - epoch_start
@@ -772,7 +785,11 @@ def train_loop(rl_config: GRPOConfig):
         all_metrics["advantage_std"] = float(np.std(advantages))
 
         if is_main:
-            wandb.log(all_metrics, step=epoch)
+            for key, value in all_metrics.items():
+                if isinstance(value, (int, float)):
+                    writer.add_scalar(f"epoch/{key}", value, epoch)
+                elif isinstance(value, str):
+                    writer.add_text(f"epoch/{key}", value, epoch)
             logging.info(f"Epoch {epoch + 1} summary: {all_metrics}")
 
         # ── Save checkpoint ──
@@ -801,11 +818,12 @@ def train_loop(rl_config: GRPOConfig):
     save_rl_checkpoint(
         model, optimizer, rl_config.total_epochs, global_step,
         rl_config, base_config, best_success_rate,
-        is_main, data_config,
+        is_main, 
     )
 
     if is_main:
-        wandb.log({"best_success_rate": best_success_rate})
+        writer.add_scalar("best_success_rate", best_success_rate, global_step)
+        writer.close()
         logging.info(f"Best success rate achieved: {best_success_rate:.4f}")
 
     cleanup_ddp()

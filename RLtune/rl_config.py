@@ -66,7 +66,7 @@ class GRPOConfig:
     num_eval_episodes: int = 20            # Number of eval episodes
 
     # ── Model ──
-    config_name: str = "srb_train"         # Base training config name
+    config_name: str = "srb_train_gemma4"         # Base training config name
     checkpoint_dir: str | None = None      # Path to SFT checkpoint to start from
     action_horizon: int = 16               # Action chunk size
     action_dim: int = 7                    # Action dimensionality

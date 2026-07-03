@@ -42,6 +42,7 @@ dependencies = [
     "evdev>=1.9.3",
     "chex==0.1.90",
     "nvidia-ml-py",
+    "tensorboard",
 ]
 
 

@@ -36,6 +36,10 @@ class Pi0Config(_model.BaseModelConfig):
 
     pytorch_compile_mode: str | None = "max-autotune"
 
+    # Path to Gemma-4 checkpoint for native vision encoder.
+    # Required when using gemma4_* variants. E.g. "./models/gemma-4-E2B"
+    gemma4_model_path: str | None = None
+
     def __post_init__(self):
         if self.max_token_len is None:
             object.__setattr__(self, "max_token_len", 200 if self.pi05 else 48)

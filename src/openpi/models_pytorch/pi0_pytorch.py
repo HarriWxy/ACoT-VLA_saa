@@ -11,7 +11,7 @@ from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 # Gemma 4 support
-_GEMMA4_VARIANTS = {"gemma4_300m", "gemma4_300m_lora", "gemma4_2b", "gemma4_2b_lora"}
+_GEMMA4_VARIANTS = {"gemma4_300m", "gemma4_300m_lora", "gemma4_2b", "gemma4_2b_lora", "gemma4_e2b", "gemma4_e2b_lora"}
 
 
 def _is_gemma4_variant(variant: str) -> bool:
@@ -107,13 +107,14 @@ class PI0Pytorch(nn.Module):
         self._is_gemma4 = _is_gemma4_variant(config.paligemma_variant)
 
         if self._is_gemma4:
-            from openpi.models_pytorch.gemma4_pytorch import PaliGemma4WithExpertModel
+            from openpi.models_pytorch.gemma4_pytorch import Gemma4WithExpertModel
 
-            self.paligemma_with_expert = PaliGemma4WithExpertModel(
+            self.paligemma_with_expert = Gemma4WithExpertModel(
                 paligemma_config,
                 action_expert_config,
                 use_adarms=[False, True] if self.pi05 else [False, False],
                 precision=config.dtype,
+                gemma4_model_path=getattr(config, "gemma4_model_path", None),
             )
         else:
             self.paligemma_with_expert = PaliGemmaWithExpertModel(
@@ -516,13 +517,21 @@ class PI0Pytorch(nn.Module):
             prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
             self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        _, past_key_values = self.paligemma_with_expert.forward(
-            attention_mask=prefix_att_2d_masks_4d,
-            position_ids=prefix_position_ids,
-            past_key_values=None,
-            inputs_embeds=[prefix_embs, None],
-            use_cache=True,
-        )
+        if self._is_gemma4:
+            # Gemma4: VLM and expert have different hidden sizes, so we can't
+            # share KV cache between them. Store prefix embeddings for joint
+            # attention in each denoise step instead.
+            self._cached_prefix_embs = prefix_embs
+            self._cached_prefix_pad_masks = prefix_pad_masks
+            past_key_values = None
+        else:
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
 
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
@@ -559,31 +568,49 @@ class PI0Pytorch(nn.Module):
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
 
-        prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
-
-        suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
-
-        full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
-
-        prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
-        position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
-
-        # Prepare attention masks
         if self._is_gemma4:
+            # Gemma4: Use joint attention with prefix embeddings (no KV cache sharing)
+            prefix_embs = self._cached_prefix_embs
+
+            # Build full prefix+suffix masks and position ids
+            prefix_att_masks = torch.zeros(prefix_len, dtype=torch.bool, device=prefix_pad_masks.device)
+            prefix_att_masks = prefix_att_masks.unsqueeze(0).expand(batch_size, -1)
+            full_pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
+            full_att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+            full_att_2d_masks = make_att_2d_masks(full_pad_masks, full_att_masks)
+            position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
+
             sliding_window = self.paligemma_with_expert.gemma4_vlm.model.config.sliding_window
             full_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(full_att_2d_masks, sliding_window)
+
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
         else:
+            # Old architecture: use expert-only forward with VLM's cached KV
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
             full_att_2d_masks_4d = self._prepare_attention_masks_4d(full_att_2d_masks)
             self.paligemma_with_expert.gemma_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        outputs_embeds, _ = self.paligemma_with_expert.forward(
-            attention_mask=full_att_2d_masks_4d,
-            position_ids=position_ids,
-            past_key_values=past_key_values,
-            inputs_embeds=[None, suffix_embs],
-            use_cache=False,
-            adarms_cond=[None, adarms_cond],
-        )
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
 
         suffix_out = outputs_embeds[1]
         suffix_out = suffix_out[:, -self.config.action_horizon :]
