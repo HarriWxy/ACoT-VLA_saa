@@ -136,8 +136,15 @@ class PI0Pytorch(nn.Module):
             self.action_time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
 
         torch.set_float32_matmul_precision("high")
-        if config.pytorch_compile_mode is not None:
-            self.sample_actions = torch.compile(self.sample_actions, mode=config.pytorch_compile_mode)
+        # 支持 OPENPI_DISABLE_COMPILE=1 环境变量禁用 torch.compile
+        # (调试器 / torch.compile 不兼容时使用)
+        import os
+        _compile_mode = config.pytorch_compile_mode
+        if os.environ.get("OPENPI_DISABLE_COMPILE", "0") == "1":
+            _compile_mode = None
+            logging.info("torch.compile disabled via OPENPI_DISABLE_COMPILE=1")
+        if _compile_mode is not None:
+            self.sample_actions = torch.compile(self.sample_actions, mode=_compile_mode)
 
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
@@ -451,7 +458,10 @@ class PI0Pytorch(nn.Module):
             first_layer = self.paligemma_with_expert.gemma4_vlm.model.layers[0]
         else:
             first_layer = self.paligemma_with_expert.paligemma.language_model.layers[0]
-        if first_layer.self_attn.q_proj.weight.dtype == torch.bfloat16:
+        # LoRA 注入后 q_proj 是 LoRALinear, 权重在 base_linear.weight
+        q_proj = first_layer.self_attn.q_proj
+        weight = q_proj.base_linear.weight if hasattr(q_proj, "base_linear") else q_proj.weight
+        if weight.dtype == torch.bfloat16:
             suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
             prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
@@ -571,6 +581,15 @@ class PI0Pytorch(nn.Module):
         if self._is_gemma4:
             # Gemma4: Use joint attention with prefix embeddings (no KV cache sharing)
             prefix_embs = self._cached_prefix_embs
+
+            # 统一 dtype: prefix/suffix embs 需要与模型权重一致 (bfloat16)
+            # LoRA 注入后 q_proj 是 LoRALinear, 权重在 base_linear.weight
+            first_layer = self.paligemma_with_expert.gemma4_vlm.model.layers[0]
+            q_proj = first_layer.self_attn.q_proj
+            weight = q_proj.base_linear.weight if hasattr(q_proj, "base_linear") else q_proj.weight
+            if weight.dtype == torch.bfloat16:
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+                prefix_embs = prefix_embs.to(dtype=torch.bfloat16)
 
             # Build full prefix+suffix masks and position ids
             prefix_att_masks = torch.zeros(prefix_len, dtype=torch.bool, device=prefix_pad_masks.device)

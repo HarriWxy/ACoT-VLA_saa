@@ -250,7 +250,57 @@ class BaseModelConfig(abc.ABC):
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
         model = pi0_pytorch.PI0Pytorch(config=train_config.model)
-        safetensors.torch.load_model(model, weight_path)
+
+        # ── 处理 LoRA 模型加载预训练权重的 key 映射 ──
+        # LoRA 模型的 Linear 层被替换为 LoRALinear, 其 base_linear 权重 key 为:
+        #   *.down_proj.base_linear.weight
+        # 而预训练 checkpoint 的 key 是:
+        #   *.down_proj.weight
+        # 需要将 checkpoint 的 key 重映射以匹配 LoRA 模型结构.
+        import torch
+        ckpt_state = safetensors.torch.load_file(weight_path)
+        model_state = model.state_dict()
+
+        # 找出模型中所有 *.base_linear.weight 的 key
+        base_linear_keys = {k for k in model_state if ".base_linear.weight" in k}
+
+        # 构建映射: checkpoint key → model key
+        remapped = {}
+        for ckpt_key, tensor in ckpt_state.items():
+            if ckpt_key in model_state:
+                # 直接匹配 (非 LoRA 层或 LoRA A/B 参数)
+                remapped[ckpt_key] = tensor
+            else:
+                # 尝试添加 base_linear 前缀
+                # e.g. *.down_proj.weight → *.down_proj.base_linear.weight
+                parts = ckpt_key.rsplit(".", 1)  # [..., "weight"]
+                if len(parts) == 2:
+                    candidate = f"{parts[0]}.base_linear.{parts[1]}"
+                    if candidate in base_linear_keys:
+                        remapped[candidate] = tensor
+                        continue
+                # 无法映射的 key 记录为 unexpected
+                logger.debug(f"load_pytorch: unexpected checkpoint key: {ckpt_key}")
+
+        # 加载映射后的权重
+        missing, unexpected = model.load_state_dict(remapped, strict=False)
+        if missing:
+            # 过滤掉 LoRA A/B 参数 (它们保持随机初始化是正确的)
+            lora_param_keys = [k for k in missing if ".lora_A" in k or ".lora_B" in k]
+            other_missing = [k for k in missing if ".lora_A" not in k and ".lora_B" not in k]
+            if lora_param_keys:
+                logger.info(f"load_pytorch: {len(lora_param_keys)} LoRA params not in checkpoint (will be trained)")
+            if other_missing:
+                logger.warning(f"load_pytorch: {len(other_missing)} unexpected missing keys!")
+                for k in other_missing[:5]:
+                    logger.warning(f"  - {k}")
+        if unexpected:
+            logger.warning(f"load_pytorch: {len(unexpected)} unexpected keys in checkpoint")
+            for k in unexpected[:5]:
+                logger.warning(f"  - {k}")
+        else:
+            logger.info("load_pytorch: all checkpoint weights loaded successfully")
+
         return model
 
     @abc.abstractmethod

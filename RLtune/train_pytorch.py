@@ -71,6 +71,17 @@ from RLtune.grpo_algo import filter_by_accuracy
 from RLtune.reward_manager import create_reward_manager
 from RLtune.rl_config import GRPOConfig
 
+# Projection head for action dim bridging
+from openpi.models_pytorch.action_proj_head import (
+    ResidualActionProjectionHead,
+    ActionProjectionHead,
+    freeze_model_train_head_only,
+    unfreeze_model_finetune,
+    get_param_groups as get_proj_param_groups,
+    save_projection_head,
+    load_projection_head,
+)
+
 # ---------------------------------------------------------------------------
 # Logging setup
 # ---------------------------------------------------------------------------
@@ -267,6 +278,7 @@ def save_rl_checkpoint(
     best_success_rate: float,
     is_main: bool,
     data_config=None,
+    projection_head: ActionProjectionHead | None = None,
 ):
     """Save RL fine-tuning checkpoint."""
     if not is_main:
@@ -282,6 +294,10 @@ def save_rl_checkpoint(
     # Save model state
     model_to_save = get_model(model)
     safetensors.torch.save_model(model_to_save, tmp_dir / "model.safetensors")
+
+    # Save projection head if present
+    if projection_head is not None:
+        save_projection_head(projection_head, tmp_dir / "projection_head.safetensors")
 
     # Save optimizer state
     torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
@@ -315,6 +331,7 @@ def load_rl_checkpoint(
     optimizer: torch.optim.Optimizer,
     checkpoint_dir: pathlib.Path,
     device: torch.device,
+    projection_head: ActionProjectionHead | None = None,
 ) -> tuple[int, float]:
     """Load RL checkpoint and return (epoch, best_success_rate)."""
     if not checkpoint_dir.exists():
@@ -336,6 +353,13 @@ def load_rl_checkpoint(
         model_to_load = get_model(model)
         safetensors.torch.load_model(model_to_load, model_path, device=str(device))
         logging.info(f"Loaded model from {model_path}")
+
+    # Load projection head if present
+    if projection_head is not None:
+        head_path = latest_dir / "projection_head.safetensors"
+        if head_path.exists():
+            load_projection_head(projection_head, head_path)
+            logging.info(f"Loaded projection head from {head_path}")
 
     # Load optimizer
     optimizer_path = latest_dir / "optimizer.pt"
@@ -554,16 +578,101 @@ def train_loop(rl_config: GRPOConfig):
             find_unused_parameters=True,
         )
 
-    # Build optimizer with lower LR for RL fine-tuning
-    rl_lr = rl_config.learning_rate
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=rl_lr,
-        betas=(0.9, 0.95),
-        eps=1e-8,
-        weight_decay=rl_config.weight_decay,
-    )
+    # ── Projection head setup ──
+    projection_head = None
+    proj_cfg = rl_config.projection_head
+    _base_model = get_model(model)
+    model_action_dim = getattr(_base_model, 'action_dim', None) or _base_model.config.action_dim  # typically 32
+
+    if proj_cfg.enabled and rl_config.action_dim != model_action_dim:
+        head_cls = ResidualActionProjectionHead if proj_cfg.head_type == "residual" else ActionProjectionHead
+        projection_head = head_cls(
+            actual_action_dim=rl_config.action_dim,
+            model_action_dim=model_action_dim,
+            hidden_dim=proj_cfg.hidden_dim,
+            num_layers=proj_cfg.num_layers,
+            activation=proj_cfg.activation,
+            use_layer_norm=proj_cfg.use_layer_norm,
+            residual_scale=proj_cfg.residual_scale,
+        ).to(device)
+
+        # Load pretrained head weights if available
+        if proj_cfg.head_checkpoint_path and os.path.exists(proj_cfg.head_checkpoint_path):
+            load_projection_head(projection_head, proj_cfg.head_checkpoint_path)
+
+        # Apply freeze strategy based on training stage
+        if proj_cfg.training_stage == "stage1":
+            freeze_model_train_head_only(get_model(model), projection_head)
+        elif proj_cfg.training_stage == "stage2":
+            unfreeze_model_finetune(
+                get_model(model), projection_head,
+                unfreeze_action_heads=True, unfreeze_backbone=False,
+            )
+        elif proj_cfg.training_stage == "stage3":
+            unfreeze_model_finetune(
+                get_model(model), projection_head,
+                unfreeze_action_heads=True, unfreeze_backbone=True,
+            )
+
+        if is_main:
+            total_params = sum(p.numel() for p in model.parameters()) + sum(p.numel() for p in projection_head.parameters())
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad) + sum(p.numel() for p in projection_head.parameters())
+            logging.info(
+                f"Projection head: {proj_cfg.training_stage} mode | "
+                f"Trainable: {trainable/1e6:.2f}M / {total_params/1e6:.2f}M total"
+            )
+
+    # ── Build optimizer ──
+    if projection_head is not None:
+        # Use param groups with different LR for head vs model
+        param_groups = get_proj_param_groups(
+            get_model(model), projection_head,
+            lr_model=proj_cfg.lr_model,
+            lr_head=proj_cfg.lr_head,
+        )
+        # Override model LR based on training stage
+        if proj_cfg.training_stage == "stage1":
+            # Stage 1: model is frozen, only head trains
+            pass  # get_proj_param_groups already handles this
+        elif proj_cfg.training_stage == "stage2":
+            pass  # model LR already set
+        elif proj_cfg.training_stage == "stage3":
+            # Add backbone group with lower LR
+            for g in param_groups:
+                if g["name"] == "model":
+                    # Split into backbone vs action heads
+                    backbone_params = []
+                    action_head_params = []
+                    action_head_names = [
+                        "action_in_proj", "action_out_proj",
+                        "time_mlp_in", "time_mlp_out",
+                        "state_proj", "action_time_mlp_in", "action_time_mlp_out",
+                    ]
+                    for p in g["params"]:
+                        # Check param name to decide group
+                        # We can't easily get the name here, so just use the model LR
+                        action_head_params.append(p)
+                    # For stage3, all model params use model LR
+                    g["lr"] = proj_cfg.lr_model
+
+        optimizer = torch.optim.AdamW(
+            param_groups,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=rl_config.weight_decay,
+        )
+        # Use the highest LR for the schedule
+        rl_lr = max(pg["lr"] for pg in param_groups)
+    else:
+        rl_lr = rl_config.learning_rate
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(
+            trainable_params,
+            lr=rl_lr,
+            betas=(0.9, 0.95),
+            eps=1e-8,
+            weight_decay=rl_config.weight_decay,
+        )
 
     # LR schedule
     total_rl_steps = rl_config.total_epochs * rl_config.num_train_steps_per_epoch
@@ -581,7 +690,8 @@ def train_loop(rl_config: GRPOConfig):
     global_step = 0
     if resuming:
         start_epoch, best_success_rate = load_rl_checkpoint(
-            model, optimizer, rl_ckpt_dir, device
+            model, optimizer, rl_ckpt_dir, device,
+            projection_head=projection_head,
         )
         # Advance scheduler to the correct step
         for _ in range(start_epoch * rl_config.num_train_steps_per_epoch):
@@ -602,6 +712,8 @@ def train_loop(rl_config: GRPOConfig):
         logging.info(f"Starting RL training for {rl_config.total_epochs} epochs from epoch {start_epoch}")
 
     model.train()
+    if projection_head is not None:
+        projection_head.train()
     start_time = time.time()
 
     for epoch in range(start_epoch, rl_config.total_epochs):
@@ -712,9 +824,14 @@ def train_loop(rl_config: GRPOConfig):
                 repeats = (batch_size // len(adv_tensor)) + 1
                 adv_tensor = adv_tensor.repeat(repeats)[:batch_size]
 
+            # Project actions to model space if using projection head
+            model_actions = actions
+            if projection_head is not None:
+                model_actions = projection_head.project_to_model(actions)
+
             # Forward + loss
             loss, step_metrics = compute_rl_loss(
-                model, observation, actions, adv_tensor,
+                model, observation, model_actions, adv_tensor,
                 coarse_actions=coarse_actions,
                 clip_advantage=3.0,
             )
@@ -722,9 +839,12 @@ def train_loop(rl_config: GRPOConfig):
             # Backward
             loss.backward()
 
-            # Gradient clipping
+            # Gradient clipping (include projection head params)
+            all_params = list(model.parameters())
+            if projection_head is not None:
+                all_params += list(projection_head.parameters())
             grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(), max_norm=rl_config.grad_clip_norm
+                all_params, max_norm=rl_config.grad_clip_norm
             )
 
             # Optimizer step
@@ -755,6 +875,11 @@ def train_loop(rl_config: GRPOConfig):
                 writer.add_scalar("step/rl_loss", avg_loss, global_step)
                 writer.add_scalar("step/grad_norm", grad_norm.item() if isinstance(grad_norm, torch.Tensor) else grad_norm, global_step)
                 writer.add_scalar("step/learning_rate", optimizer.param_groups[0]["lr"], global_step)
+                # Log projection head LR if using param groups
+                if projection_head is not None and len(optimizer.param_groups) > 1:
+                    for pg in optimizer.param_groups:
+                        if pg.get("name") == "projection_head":
+                            writer.add_scalar("step/lr_head", pg["lr"], global_step)
                 for key, value in step_metrics.items():
                     if isinstance(value, (int, float)):
                         writer.add_scalar(f"step/{key}", value, global_step)
@@ -800,6 +925,7 @@ def train_loop(rl_config: GRPOConfig):
                 model, optimizer, epoch + 1, global_step,
                 rl_config, base_config, best_success_rate,
                 is_main, data_config,
+                projection_head=projection_head,
             )
 
         # ── Track best model ──
@@ -811,6 +937,8 @@ def train_loop(rl_config: GRPOConfig):
                 best_dir = base_config.checkpoint_dir / "rl_grpo" / "best"
                 best_dir.mkdir(parents=True, exist_ok=True)
                 safetensors.torch.save_model(get_model(model), best_dir / "model.safetensors")
+                if projection_head is not None:
+                    save_projection_head(projection_head, best_dir / "projection_head.safetensors")
 
     # Final save
     if is_main:
@@ -818,7 +946,8 @@ def train_loop(rl_config: GRPOConfig):
     save_rl_checkpoint(
         model, optimizer, rl_config.total_epochs, global_step,
         rl_config, base_config, best_success_rate,
-        is_main, 
+        is_main,
+        projection_head=projection_head,
     )
 
     if is_main:

@@ -8,6 +8,43 @@ from typing import Literal
 
 
 @dataclasses.dataclass(frozen=True)
+class ProjectionHeadConfig:
+    """Configuration for action projection head.
+
+    When actual_action_dim != model_action_dim (typically 32), a learnable
+    projection head bridges the gap. The head maps between the environment's
+    action space and the model's internal action space.
+
+    Training stages:
+        stage1: freeze model, train projection head only (high LR)
+        stage2: unfreeze action heads, fine-tune all (medium LR)
+        stage3: unfreeze backbone, full fine-tune (low LR)
+    """
+
+    enabled: bool = False                       # Enable projection head
+    head_type: Literal["mlp", "residual"] = "residual"  # Projection architecture
+    hidden_dim: int | None = None               # Hidden dim (None = auto)
+    num_layers: int = 2                         # Number of MLP layers
+    activation: str = "silu"                    # Activation function
+    use_layer_norm: bool = True                 # LayerNorm in MLP
+    residual_scale: float = 0.1                 # Initial residual scale
+
+    # ── Training stage control ──
+    training_stage: Literal["stage1", "stage2", "stage3"] = "stage1"
+    # stage1: freeze model, train head only
+    # stage2: unfreeze action heads + train head
+    # stage3: unfreeze backbone + train all
+
+    # ── Learning rates ──
+    lr_head: float = 1e-4                       # LR for projection head
+    lr_model: float = 5e-6                      # LR for model (stage2/3)
+    lr_backbone: float = 1e-6                   # LR for backbone (stage3)
+
+    # ── Checkpoint ──
+    head_checkpoint_path: str | None = None     # Path to load/save head weights
+
+
+@dataclasses.dataclass(frozen=True)
 class GRPOConfig:
     """GRPO (Group Relative Policy Optimization) hyperparameters.
 
@@ -70,6 +107,11 @@ class GRPOConfig:
     checkpoint_dir: str | None = None      # Path to SFT checkpoint to start from
     action_horizon: int = 16               # Action chunk size
     action_dim: int = 7                    # Action dimensionality
+
+    # ── Projection Head (for action_dim > 32) ──
+    projection_head: ProjectionHeadConfig = dataclasses.field(
+        default_factory=ProjectionHeadConfig
+    )
 
     # ── Distributed ──
     num_workers: int = 4                   # Number of parallel environment workers

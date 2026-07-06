@@ -55,7 +55,7 @@ def _detect_obs_features(obs: dict) -> tuple[dict, list[str], list[str]]:
       - image_base           → observation.images.image_base
       - image_wrist          → observation.images.image_wrist
     """
-    state_keys = ("proprio",)
+    state_keys = ("state","proprio",)
     image_keys = []
     for key in obs:
         if key == "prompt":
@@ -98,8 +98,8 @@ class ServerConfig:
     port: int | None = None
     metadata: dict | None = None
     
-    # 数据集配置
-    repo_id: str = "srb_dataset"
+    # 数据集配置 
+    repo_id: str = "srb_tracking" # srb_dataset
     fps: int = 10
     robot_type: str = "srb"
     

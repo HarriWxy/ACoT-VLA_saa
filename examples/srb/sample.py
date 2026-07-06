@@ -13,13 +13,13 @@ from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
 @dataclasses.dataclass
 class Args:
-    env_id: str = "srb/sample_collection_visual"
-    prompt: str = "collect the sample"
+    env_id: str = "srb/locomotion_velocity_tracking" # sample_collection_visual
+    prompt: str = "walk and track the velocity command"  # collect the sample
 
     host: str = "0.0.0.0"
     port: int = 8000
 
-    repo_id: str = "srb_dataset"
+    repo_id: str = "srb_tracking"
     fps: int = 10
     robot_type: str = "srb"
 

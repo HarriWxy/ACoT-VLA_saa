@@ -28,6 +28,11 @@ from transformers import AutoImageProcessor
 from transformers import Gemma4ForCausalLM
 from transformers import Gemma4ForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
+
+
+def _get_weight(module: nn.Module) -> torch.Tensor:
+    """获取模块权重, 兼容 LoRALinear (权重在 base_linear.weight)。"""
+    return module.base_linear.weight if hasattr(module, "base_linear") else module.weight
 from transformers.models.gemma4.modeling_gemma4 import repeat_kv
 import numpy as np
 from PIL import Image
@@ -497,8 +502,8 @@ class Gemma4WithExpertModel(nn.Module):
             expert_att_out = att_output[:, vlm_seq_len:]
 
             # --- VLM: o_proj + post_attn_norm + residual ---
-            if vlm_att_out.dtype != vlm_layer.self_attn.o_proj.weight.dtype:
-                vlm_att_out = vlm_att_out.to(vlm_layer.self_attn.o_proj.weight.dtype)
+            if vlm_att_out.dtype != _get_weight(vlm_layer.self_attn.o_proj).dtype:
+                vlm_att_out = vlm_att_out.to(_get_weight(vlm_layer.self_attn.o_proj).dtype)
             vlm_att_out = vlm_layer.self_attn.o_proj(vlm_att_out)
             vlm_post_attn = vlm_layer.post_attention_layernorm(vlm_att_out)
             vlm_post_attn, vlm_post_gate = (
@@ -507,8 +512,8 @@ class Gemma4WithExpertModel(nn.Module):
             vlm_hidden = _gated_residual(vlm_hidden, vlm_post_attn, vlm_gate or vlm_post_gate)
 
             # --- Expert: o_proj + post_attn_norm + residual ---
-            if expert_att_out.dtype != expert_layer.self_attn.o_proj.weight.dtype:
-                expert_att_out = expert_att_out.to(expert_layer.self_attn.o_proj.weight.dtype)
+            if expert_att_out.dtype != _get_weight(expert_layer.self_attn.o_proj).dtype:
+                expert_att_out = expert_att_out.to(_get_weight(expert_layer.self_attn.o_proj).dtype)
             expert_att_out = expert_layer.self_attn.o_proj(expert_att_out)
             expert_post_attn = expert_layer.post_attention_layernorm(expert_att_out)
             expert_post_attn, expert_post_gate = (

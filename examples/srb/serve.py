@@ -12,11 +12,11 @@ from openpi.serving import websocket_policy_server_sample as wps_sample
 
 @dataclasses.dataclass
 class Args:
-    policy_mode: Literal["model", "random", "zero"] = "random"
+    policy_mode: Literal["model", "random", "zero"] = "model"
     config_name: str = "pi05_srb"
     checkpoint_dir: str = ".cache/openpi/openpi-assets/checkpoints/pi05_base"
     action_horizon: int = 16
-    action_dim: int = 7
+    action_dim: int = 37
     random_seed: int = 0
     random_action_scale: float = 0.25
     host: str = "0.0.0.0" # ""127.168.1.116

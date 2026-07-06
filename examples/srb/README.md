@@ -16,6 +16,12 @@
 - `examples/srb/main.py`
   - 直接在 SRB 环境里 rollout，并通过 websocket 请求 policy action chunk。
 
+## 采样
+
+`src/openpi/serving/websocket_policy_server_sample.py`
+
+在 `serve.py` 里直接调用 `websocket_policy_server_sample.py` 的 `rollout()`，从远程 SRB 环境里采样。
+
 ## 推理
 
 前提：
