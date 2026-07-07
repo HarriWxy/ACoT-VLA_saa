@@ -9,7 +9,7 @@ from openpi_client import base_policy as _base_policy
 from openpi.policies import debug_policy as _debug_policy
 # from openpi.serving import websocket_policy_server
 
-SAMPLE = False  # True=使用 websocket_policy_server_sample, False=使用 websocket_policy_server
+SAMPLE = True  # True=使用 websocket_policy_server_sample, False=使用 websocket_policy_server
 
 if SAMPLE:
     from openpi.serving import websocket_policy_server_sample as wps_sample
@@ -21,7 +21,7 @@ os.environ["OPENPI_DISABLE_COMPILE"] = "1"  # 禁用 torch.compile, 避免与调
 
 @dataclasses.dataclass
 class Args:
-    policy_mode: Literal["model", "random", "zero"] = "model"
+    policy_mode: Literal["model", "random", "zero"] = "random"
     # PyTorch 模型专用配置
     config_name: str = "srb_train_gemma4"
     checkpoint_dir: str = "checkpoints/gemma4"

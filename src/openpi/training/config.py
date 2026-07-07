@@ -1136,8 +1136,21 @@ _CONFIGS = [
             repo_id="srb_tracking",
             base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
             action_dim=37,
-            observation_keys=("state","proprio"),
-            image_keys=("image_base", "image_wrist"),
+            observation_keys=("state",),
+            image_keys=("image_base",),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "image_base": "observation.images.image_front",
+                            "action": "action",
+                            "reward": "reward",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20,

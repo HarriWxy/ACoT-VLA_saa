@@ -19,7 +19,7 @@ import os
 os.environ["HF_DATASETS_OFFLINE"] = "1"
 os.environ["TRANSFORMERS_OFFLINE"] = "1"
 os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]=0.9
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 
 
 class RemoveStrings(transforms.DataTransformFn):
@@ -121,4 +121,4 @@ def main(config_name: str, max_frames: int | None = None):
 
 if __name__ == "__main__":
     # tyro.cli(main)
-    main(config_name="srb_train")
+    main(config_name="srb_train_gemma4")

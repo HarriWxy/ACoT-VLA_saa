@@ -83,8 +83,8 @@ def _detect_obs_features(obs: dict) -> tuple[dict, list[str], list[str]]:
         h, w = img.shape[:2]
         features[f"observation.images.{key}"] = {
             "dtype": "image",
-            "shape": (3, h, w),
-            "names": ["channels", "height", "width"],
+            "shape": (h, w, 3),
+            "names": ["height", "width", "channels"],
         }
 
     return features, state_keys, image_keys
@@ -110,7 +110,7 @@ class ServerConfig:
     image_writer_threads: int = 5
     
     # 动作配置
-    action_dim: int = 7
+    action_dim: int = 37
     
     # ── 探索噪声配置 ──────────────────────────────────────────
     # 噪声模式:
@@ -187,6 +187,13 @@ class WebsocketPolicyServer:
             "names": ["actions"],
         }
         
+        # 添加奖励特征 (用于强化学习微调)
+        self._features["reward"] = {
+            "dtype": "float32",
+            "shape": (1,1),
+            "names": ["reward"],
+        }
+        
         logger.info("Detected state keys: %s", self._state_keys)
         logger.info("Detected image keys: %s", self._image_keys)
         logger.info("LeRobot features: %s", list(self._features.keys()))
@@ -257,6 +264,10 @@ class WebsocketPolicyServer:
                     download_videos=False,
                 )
                 
+                # LeRobotDataset() 构造函数不初始化 episode_buffer（只有 .create() 会）
+                # 追加新数据前必须手动创建
+                self._dataset.episode_buffer = self._dataset.create_episode_buffer()
+                
                 # 验证本地数据集
                 logger.info("Loaded local LeRobotDataset at %s with %d episodes", 
                            dataset_path, self._dataset.num_episodes)
@@ -300,6 +311,14 @@ class WebsocketPolicyServer:
         # 添加动作
         frame["action"] = action.astype(np.float32)
         frame["task"] = task
+        # reward 存为 (1,1) ndarray, 匹配 feature shape, 兼容 validate_frame 和 Array2D
+        reward = obs.get("reward", np.zeros((1,1), dtype=np.float32)).astype(np.float32)
+        if isinstance(reward, np.ndarray) and reward.ndim <= 2:
+            reward = reward.reshape(1, 1)
+        else:
+            reward = np.array([[float(reward)]], dtype=np.float32)
+        frame["reward"] = reward
+        # frame["reward"] = obs.get("reward", np.zeros(1, dtype=np.float32)).astype(np.float32) # reward  
         
         # 写入数据集
         self._dataset.add_frame(frame)
@@ -407,7 +426,7 @@ class WebsocketPolicyServer:
                 start_time = time.monotonic()
                 obs = msgpack_numpy.unpackb(await websocket.recv())
                 
-                done  = obs["done"] if "done" in obs else False
+                done = obs["done"] if "done" in obs else False
                 task = obs["prompt"] if "prompt" in obs else ""
                 # 支持两种消息格式：
                 # 1. 简单格式: 只包含观测数据
@@ -473,7 +492,7 @@ class WebsocketPolicyServer:
                 logger.info(f"Connection from {websocket.remote_address} closed")
                 # 保存未完成的 episode
                 if episode_step > 0:
-                    self.save_episode()
+                    self.save_episode()  # 要先关闭仿真再退出这边
                 break
             except Exception:
                 await websocket.send(traceback.format_exc())

@@ -116,7 +116,7 @@ def init_logging():
 
 
 def setup_ddp():
-    """Initialize distributed training."""
+    """Initialize distributed training. (torch) """
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     use_ddp = world_size > 1
     if use_ddp and not torch.distributed.is_initialized():
