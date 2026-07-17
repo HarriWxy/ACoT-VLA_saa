@@ -393,7 +393,7 @@ class PI0Pytorch(nn.Module):
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions)
+            return self.action_in_proj(noisy_actions)  # [B, action_horizon, action_dim] -> [B, action_horizon, width] action dim!=32
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 

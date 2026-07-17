@@ -73,7 +73,7 @@ def preprocess_observation_pytorch(
 
                 # Resize back to original size
                 image = torch.nn.functional.interpolate(
-                    image.permute(0, 3, 1, 2),  # [b, h, w, c] -> [b, c, h, w]
+                    image.permute(0, 3, 1, 2),  # Tensor [b, h, w, c] -> [b, c, h, w] 
                     size=(height, width),
                     mode="bilinear",
                     align_corners=False,

@@ -46,6 +46,8 @@ import openpi.shared.normalize as _normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data
 
+import sys
+
 
 def init_logging():
     level_mapping = {"DEBUG": "D", "INFO": "I", "WARNING": "W", "ERROR": "E", "CRITICAL": "C"}
@@ -697,4 +699,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    # add for debug
+    old_argv = sys.argv[:]
+    argv=["srb_train_gemma4", "--exp_name", "pytorch_ddp_test"]
+    try:
+        sys.argv = [old_argv[0], *argv]
+        main()
+    finally:
+        sys.argv = old_argv
+
+    # main()

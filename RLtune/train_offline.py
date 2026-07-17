@@ -71,6 +71,8 @@ from RLtune.train_pytorch import save_rl_checkpoint
 from RLtune.train_pytorch import set_seed
 from RLtune.train_pytorch import setup_ddp
 
+from openpi.models_pytorch.pi0_pytorch import PI0Pytorch 
+
 # ---------------------------------------------------------------------------
 # Offline GRPO Config
 # ---------------------------------------------------------------------------
@@ -102,7 +104,7 @@ class OfflineGRPOConfig:
     accuracy_upper_bound: float = 0.9
 
     # ── Training schedule ──
-    total_epochs: int = 100
+    total_epochs: int = 200
     num_train_steps_per_epoch: int = 50
     learning_rate: float = 5e-6
     warmup_steps: int = 100
@@ -198,7 +200,7 @@ def train_loop(rl_config: OfflineGRPOConfig):
         logging.info(f"Reward stats: {reward_stats}")
 
     # ── Build model ──
-    model = build_model(base_config, device)
+    model: PI0Pytorch = build_model(base_config, device)
 
     # Load SFT weights if starting fresh
     if not resuming and base_config.pytorch_weight_path is not None:
@@ -289,7 +291,7 @@ def train_loop(rl_config: OfflineGRPOConfig):
             scheduler.step()
         global_step = start_epoch * rl_config.num_train_steps_per_epoch
 
-    # RNG for episode sampling
+    # RNG for episode sampling 随机数生成器
     rng = np.random.default_rng(rl_config.seed + local_rank)
 
     # ── Training loop ──
@@ -329,7 +331,7 @@ def train_loop(rl_config: OfflineGRPOConfig):
             )
 
         # ── Phase 3: Filter by accuracy (optional) ──
-        if rl_config.filter_by_accuracy:
+        if rl_config.filter_by_accuracy:  # 
             binary_rewards = np.array([1.0 if dataset.get_episode_success(ep) else 0.0 for ep in group])
             mask, filter_metrics = filter_by_accuracy(
                 binary_rewards,

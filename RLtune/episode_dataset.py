@@ -24,6 +24,8 @@ from typing import Any, Literal, Sequence
 import numpy as np
 import torch
 
+import openpi.models.model as _model
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,7 +71,7 @@ class EpisodeAwareDataset:
         reward_col = np.array(hf["reward"]).flatten()
 
         # Build episode index: episode_index -> list of sample indices
-        self._episode_to_indices: dict[int, list[int]] = defaultdict(list)
+        self._episode_to_indices: dict[int, list[int]] = defaultdict(list) # initialize a dictionary to map episode indices to sample indices
         for i, ep_idx in enumerate(ep_col):
             self._episode_to_indices[int(ep_idx)].append(i)
 
@@ -237,14 +239,15 @@ class EpisodeAwareDataset:
                 obs_batch[key] = {}
                 for subkey in values[0]:
                     subvalues = [v[subkey] for v in values]
-                    if hasattr(subvalues[0], "numpy"):
-                        obs_batch[key][subkey] = torch.stack(subvalues)
+                    if isinstance(subvalues[0], np.ndarray):
+                        obs_batch[key][subkey] = torch.tensor(subvalues)
                     else:
-                        obs_batch[key][subkey] = np.stack(subvalues)
+                        tmp_np = np.stack(subvalues)
+                        obs_batch[key][subkey] = torch.tensor(tmp_np)
             elif isinstance(values[0], str):
                 obs_batch[key] = values
-            elif hasattr(values[0], "numpy"):
-                obs_batch[key] = torch.stack(values)
+            elif isinstance(values[0], np.ndarray):
+                obs_batch[key] = torch.tensor(values)
             else:
                 obs_batch[key] = np.stack(values)
 
@@ -252,11 +255,13 @@ class EpisodeAwareDataset:
         action_list = []
         for obs in all_observations:
             a = obs["actions"]
-            if hasattr(a, "numpy"):
-                a = a.numpy()
-            action_list.append(np.asarray(a, dtype=np.float32))
+            if isinstance(a, np.ndarray):
+                a = a
+            else:
+                a = np.array(a)
+            action_list.append(a)
         action_batch = np.stack(action_list)
 
         reward_batch = np.array(all_rewards, dtype=np.float32)
 
-        return obs_batch, action_batch, reward_batch
+        return _model.Observation.from_dict(obs_batch), action_batch, reward_batch

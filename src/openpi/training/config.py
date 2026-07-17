@@ -1424,6 +1424,21 @@ _CONFIGS = [
         exp_name="debug_pi05",
         wandb_enabled=False,
     ),
+    TrainConfig(
+        name="debug_pi05_gemma4",
+        model=pi0_config.Pi0Config(pi05=True, paligemma_variant="gemma4_e2b_lora", 
+                action_expert_variant="gemma4_300m_lora",gemma4_model_path="./models/gemma-4-E2B",),
+        data=LeRobotLiberoDataConfig(
+            repo_id="srb_tracking",
+            base_config=DataConfig(prompt_from_task=True),
+            extra_delta_transform=True,
+        ),
+        batch_size=2,
+        num_train_steps=10,
+        overwrite=True,
+        exp_name="debug_pi05",
+        wandb_enabled=False,
+    ),
     # RoboArena & PolaRiS configs.
     *roboarena_config.get_roboarena_configs(),
     *polaris_config.get_polaris_configs(),

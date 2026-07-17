@@ -460,7 +460,7 @@ def compute_rl_loss(
             metrics["sc_loss"] = sc_loss.item() if isinstance(sc_loss, torch.Tensor) else sc_loss
 
     else:
-        # PI0 forward pass: returns per-element MSE loss [B, action_horizon, action_dim]
+        # PI0 forward pass: returns per-element MSE loss [B, action_horizon, action_dim] # obs:dict  actions: tensor
         per_element_loss = model(observation, actions)
 
         # Reduce to per-sample loss [B]
@@ -924,7 +924,7 @@ def train_loop(rl_config: GRPOConfig):
             save_rl_checkpoint(
                 model, optimizer, epoch + 1, global_step,
                 rl_config, base_config, best_success_rate,
-                is_main, data_config,
+                is_main, data_config, # 
                 projection_head=projection_head,
             )
 
