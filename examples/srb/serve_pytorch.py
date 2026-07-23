@@ -21,14 +21,14 @@ os.environ["OPENPI_DISABLE_COMPILE"] = "1"  # 禁用 torch.compile, 避免与调
 
 @dataclasses.dataclass
 class Args:
-    policy_mode: Literal["model", "random", "zero"] = "random"
+    policy_mode: Literal["model", "random", "zero"] = "model"
     # PyTorch 模型专用配置
     config_name: str = "srb_train_gemma4"
     checkpoint_dir: str = "checkpoints/gemma4"
     # PyTorch 推理设备: "cpu", "cuda", "cuda:0", "cuda:1" 等
     pytorch_device: str | None = None  # None = 自动选择 (有 GPU 用 cuda, 否则 cpu)
     action_horizon: int = 16
-    action_dim: int = 37
+    action_dim: int = 19
     random_seed: int = 0
     random_action_scale: float = 0.25
     host: str = "0.0.0.0" # ""127.168.1.116

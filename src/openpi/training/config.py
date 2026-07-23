@@ -1135,8 +1135,8 @@ _CONFIGS = [
         data=SRBDataConfig(
             repo_id="srb_tracking",
             base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
-            action_dim=37,
-            observation_keys=("state",),
+            action_dim=19,
+            observation_keys=("state","proprio"),
             image_keys=("image_base",),
             repack_transforms=_transforms.Group(
                 inputs=[
@@ -1152,9 +1152,9 @@ _CONFIGS = [
                 ]
             ),
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20,
-        batch_size=32,
+        batch_size=4,
         exp_name="srb_sample",
         save_interval=100,
         overwrite=True,
@@ -1162,7 +1162,7 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(
             pi05=True, action_horizon=16, discrete_state_input=False,
             paligemma_variant="gemma4_e2b_lora",
-            action_expert_variant="gemma4_300m_lora",
+            action_expert_variant="gemma4_300m_aligned_lora",
             gemma4_model_path="./models/gemma-4-E2B",
         ).get_freeze_filter(),
         ema_decay=None,

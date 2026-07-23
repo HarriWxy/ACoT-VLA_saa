@@ -65,6 +65,8 @@ Variant = Literal[
     "gemma4_2b_lora",
     "gemma4_e2b",
     "gemma4_e2b_lora",
+    "gemma4_300m_aligned",
+    "gemma4_300m_aligned_lora",
 ]
 
 
@@ -184,6 +186,31 @@ def get_config(variant: Variant) -> Config:
         return Config(
             width=1536,
             depth=35,
+            mlp_dim=6144,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            global_head_dim=256,
+            lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
+        )
+    if variant == "gemma4_300m_aligned":
+        # Action expert with VLM-aligned width (1536) for KV cache reuse.
+        # depth=18 (unchanged), width/mlp_dim aligned to gemma4_e2b VLM.
+        # ~672M params, enables prefix KV caching during inference.
+        return Config(
+            width=1536,
+            depth=18,
+            mlp_dim=6144,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            global_head_dim=256,
+        )
+    if variant == "gemma4_300m_aligned_lora":
+        # Action expert with VLM-aligned width + LoRA
+        return Config(
+            width=1536,
+            depth=18,
             mlp_dim=6144,
             num_heads=8,
             num_kv_heads=1,

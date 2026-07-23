@@ -110,7 +110,7 @@ class ServerConfig:
     image_writer_threads: int = 5
     
     # 动作配置
-    action_dim: int = 37
+    action_dim: int = 32
     
     # ── 探索噪声配置 ──────────────────────────────────────────
     # 噪声模式:

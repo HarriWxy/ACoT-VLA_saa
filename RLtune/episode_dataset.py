@@ -240,6 +240,7 @@ class EpisodeAwareDataset:
                 for subkey in values[0]:
                     subvalues = [v[subkey] for v in values]
                     if isinstance(subvalues[0], np.ndarray):
+                        subvalues = np.stack(subvalues)
                         obs_batch[key][subkey] = torch.tensor(subvalues)
                     else:
                         tmp_np = np.stack(subvalues)
@@ -247,9 +248,10 @@ class EpisodeAwareDataset:
             elif isinstance(values[0], str):
                 obs_batch[key] = values
             elif isinstance(values[0], np.ndarray):
+                values = np.stack(values)
                 obs_batch[key] = torch.tensor(values)
             else:
-                obs_batch[key] = np.stack(values)
+                obs_batch[key] = torch.tensor(np.stack(values))
 
         # Stack actions
         action_list = []

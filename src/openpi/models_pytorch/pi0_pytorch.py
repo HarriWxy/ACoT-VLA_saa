@@ -149,6 +149,18 @@ class PI0Pytorch(nn.Module):
         # Initialize gradient checkpointing flag
         self.gradient_checkpointing_enabled = False
 
+        # Check if action expert width matches VLM width (enables KV cache reuse)
+        self._is_aligned_expert = (
+            self._is_gemma4
+            and paligemma_config.width == action_expert_config.width
+            and paligemma_config.head_dim == action_expert_config.head_dim
+        )
+        if self._is_aligned_expert:
+            logging.info(
+                f"Expert aligned with VLM (width={paligemma_config.width}, "
+                f"head_dim={paligemma_config.head_dim}) — KV cache reuse enabled"
+            )
+
         # transformers_replace check is only needed for Gemma 2 based models
         # (Gemma 4 is natively supported in transformers 5.x)
         if not self._is_gemma4:
@@ -193,6 +205,54 @@ class PI0Pytorch(nn.Module):
         trainable_count = _freeze(self.paligemma_with_expert)
 
         # Always keep action heads trainable
+        trainable_count = self._unfreeze_action_heads()
+
+        logging.info(f"Froze non-LoRA params. Trainable: {trainable_count / 1e6:.2f}M")
+        return trainable_count
+
+    def freeze_vlm_only(self):
+        """Freeze only the VLM (PaliGemma) and keep action expert fully trainable.
+
+        Unlike freeze_non_lora_params() which freezes everything except LoRA adapters,
+        this method freezes the entire VLM (including its LoRA adapters) while keeping
+        the action expert's ALL parameters (base weights + LoRA) trainable.
+
+        Use case: fine-tuning only the action expert while reusing a frozen VLM.
+
+        Keeps trainable:
+        - Action expert ALL parameters (gemma4_expert / action expert backbone)
+        - Action projection layers (action_in_proj, action_out_proj)
+        - State/time MLP layers (state_proj, action_time_mlp_*, time_mlp_*)
+        """
+        trainable_count = 0
+
+        # Step 1: Freeze everything
+        for param in self.parameters():
+            param.requires_grad_(False)
+
+        # Step 2: Unfreeze action expert (all params)
+        if hasattr(self.paligemma_with_expert, "gemma4_expert"):
+            for param in self.paligemma_with_expert.gemma4_expert.parameters():
+                param.requires_grad_(True)
+                trainable_count += param.numel()
+        elif hasattr(self.paligemma_with_expert, "expert"):
+            for param in self.paligemma_with_expert.expert.parameters():
+                param.requires_grad_(True)
+                trainable_count += param.numel()
+
+        # Step 3: Unfreeze action heads
+        trainable_count = self._unfreeze_action_heads(trainable_count)
+
+        logging.info(f"Froze VLM only. Trainable: {trainable_count / 1e6:.2f}M")
+        return trainable_count
+
+    def _unfreeze_action_heads(self, initial_count: int = 0) -> int:
+        """Unfreeze action projection and state/time MLP layers.
+
+        Returns:
+            Updated trainable parameter count.
+        """
+        trainable_count = initial_count
         action_head_params = [
             self.action_in_proj.parameters(),
             self.action_out_proj.parameters(),
@@ -214,7 +274,6 @@ class PI0Pytorch(nn.Module):
                 p.requires_grad_(True)
                 trainable_count += p.numel()
 
-        logging.info(f"Froze non-LoRA params. Trainable: {trainable_count / 1e6:.2f}M")
         return trainable_count
 
     def count_trainable_params(self) -> tuple[int, int]:
@@ -469,7 +528,7 @@ class PI0Pytorch(nn.Module):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1 # position_ids shape: [batch_size, seq_len] 
 
         # Prepare attention masks (Gemma 4 needs dual masks: full + sliding window)
         if self._is_gemma4:
@@ -527,10 +586,20 @@ class PI0Pytorch(nn.Module):
             prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
             self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
 
-        if self._is_gemma4:
-            # Gemma4: VLM and expert have different hidden sizes, so we can't
-            # share KV cache between them. Store prefix embeddings for joint
-            # attention in each denoise step instead.
+        if self._is_gemma4 and self._is_aligned_expert:
+            # Aligned Gemma4: VLM and expert share the same hidden_size/head_dim,
+            # so we can reuse VLM's KV cache across denoise steps (same as Gemma2).
+            self.paligemma_with_expert.gemma4_vlm.model.config._attn_implementation = "eager"  # noqa: SLF001
+            _, past_key_values = self.paligemma_with_expert.forward(
+                attention_mask=prefix_att_2d_masks_4d,
+                position_ids=prefix_position_ids,
+                past_key_values=None,
+                inputs_embeds=[prefix_embs, None],
+                use_cache=True,
+            )
+        elif self._is_gemma4:
+            # Non-aligned Gemma4: VLM and expert have different hidden sizes,
+            # can't share KV cache. Store prefix embeddings for joint attention.
             self._cached_prefix_embs = prefix_embs
             self._cached_prefix_pad_masks = prefix_pad_masks
             past_key_values = None
@@ -578,12 +647,39 @@ class PI0Pytorch(nn.Module):
         batch_size = prefix_pad_masks.shape[0]
         prefix_len = prefix_pad_masks.shape[1]
 
-        if self._is_gemma4:
-            # Gemma4: Use joint attention with prefix embeddings (no KV cache sharing)
+        if self._is_gemma4 and self._is_aligned_expert:
+            # Aligned Gemma4: reuse VLM's cached KV (same pattern as Gemma2)
+            first_layer = self.paligemma_with_expert.gemma4_vlm.model.layers[0]
+            q_proj = first_layer.self_attn.q_proj
+            weight = q_proj.base_linear.weight if hasattr(q_proj, "base_linear") else q_proj.weight
+            if weight.dtype == torch.bfloat16:
+                suffix_embs = suffix_embs.to(dtype=torch.bfloat16)
+
+            # Build suffix-only mask: suffix attends to all prefix + causal suffix
+            prefix_pad_2d_masks = prefix_pad_masks[:, None, :].expand(batch_size, suffix_len, prefix_len)
+            suffix_att_2d_masks = make_att_2d_masks(suffix_pad_masks, suffix_att_masks)
+            full_att_2d_masks = torch.cat([prefix_pad_2d_masks, suffix_att_2d_masks], dim=2)
+
+            # Position ids: offset by prefix length
+            prefix_offsets = torch.sum(prefix_pad_masks, dim=-1)[:, None]
+            position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
+
+            sliding_window = self.paligemma_with_expert.gemma4_vlm.model.config.sliding_window
+            full_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(full_att_2d_masks, sliding_window)
+            self.paligemma_with_expert.gemma4_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
+
+            outputs_embeds, _ = self.paligemma_with_expert.forward(
+                attention_mask=full_att_2d_masks_4d,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                inputs_embeds=[None, suffix_embs],
+                use_cache=False,
+                adarms_cond=[None, adarms_cond],
+            )
+        elif self._is_gemma4:
+            # Non-aligned Gemma4: joint attention with prefix embeddings (no KV cache)
             prefix_embs = self._cached_prefix_embs
 
-            # 统一 dtype: prefix/suffix embs 需要与模型权重一致 (bfloat16)
-            # LoRA 注入后 q_proj 是 LoRALinear, 权重在 base_linear.weight
             first_layer = self.paligemma_with_expert.gemma4_vlm.model.layers[0]
             q_proj = first_layer.self_attn.q_proj
             weight = q_proj.base_linear.weight if hasattr(q_proj, "base_linear") else q_proj.weight

@@ -153,9 +153,15 @@ def set_seed(seed: int, local_rank: int):
 
 
 def get_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Get the underlying model, unwrapping DDP if needed."""
+    """Get the underlying model, unwrapping DDP/FSDP if needed."""
     if isinstance(model, torch.nn.parallel.DistributedDataParallel):
         return model.module
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as _FSDP
+        if isinstance(model, _FSDP):
+            return model.module
+    except ImportError:
+        pass
     return model
 
 

@@ -26,10 +26,12 @@ Usage:
 from __future__ import annotations
 
 import dataclasses
+import functools
 import logging
 import os
 import pathlib
 import platform
+import shutil
 import sys
 import time
 from typing import Literal
@@ -71,7 +73,162 @@ from RLtune.train_pytorch import save_rl_checkpoint
 from RLtune.train_pytorch import set_seed
 from RLtune.train_pytorch import setup_ddp
 
-from openpi.models_pytorch.pi0_pytorch import PI0Pytorch 
+from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
+
+# FSDP imports (available in PyTorch 2.0+)
+try:
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+    from torch.distributed.fsdp import MixedPrecision
+    from torch.distributed.fsdp import ShardingStrategy
+    from torch.distributed.fsdp import StateDictType
+    from torch.distributed.fsdp import FullStateDictConfig
+    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+    _HAS_FSDP = True
+except ImportError:
+    _HAS_FSDP = False
+
+
+# ---------------------------------------------------------------------------
+# FSDP helpers
+# ---------------------------------------------------------------------------
+
+
+def wrap_model_fsdp(model: torch.nn.Module, device: torch.device) -> torch.nn.Module:
+    """Wrap model with FSDP for parameter sharding across GPUs.
+
+    Uses FULL_SHARD strategy so each GPU only holds 1/N of parameters,
+    gradients, and optimizer states.  Combined with gradient checkpointing
+    this dramatically reduces per-GPU memory.
+    """
+    if not _HAS_FSDP:
+        raise RuntimeError("FSDP not available — upgrade to PyTorch 2.0+")
+
+    # Wrap sub-modules with >10M params as separate FSDP units
+    auto_wrap_policy = functools.partial(
+        size_based_auto_wrap_policy,
+        min_num_params=10_000_000,
+    )
+
+    # Mixed-precision policy: compute in bf16, reduce in bf16
+    mp_policy = MixedPrecision(
+        param_dtype=torch.bfloat16,
+        reduce_dtype=torch.bfloat16,
+        buffer_dtype=torch.bfloat16,
+    )
+
+    model = FSDP(
+        model,
+        auto_wrap_policy=auto_wrap_policy,
+        mixed_precision=mp_policy,
+        sharding_strategy=ShardingStrategy.FULL_SHARD,
+        device_id=device,
+        use_orig_params=True,   # needed for optimizer param groups & checkpoint compat
+        sync_module_states=True,  # broadcast weights from rank-0 after load
+    )
+    logging.info("Model wrapped with FSDP (FULL_SHARD, bf16 mixed-precision)")
+    return model
+
+
+def save_fsdp_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    global_step: int,
+    rl_config,
+    base_config,
+    best_reward: float,
+    is_main: bool,
+    projection_head: ActionProjectionHead | None = None,
+):
+    """FSDP-aware checkpoint save.
+
+    All ranks enter the state_dict_type context (required for FSDP gather),
+    but only rank-0 writes to disk.
+    """
+    ckpt_dir = base_config.checkpoint_dir / "rl_grpo" / f"epoch_{epoch}"
+    tmp_dir = base_config.checkpoint_dir / "rl_grpo" / f"tmp_epoch_{epoch}"
+
+    # Gather full (unsharded) state dict to CPU on rank-0 only
+    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+        state_dict = model.state_dict()
+        if is_main:
+            if tmp_dir.exists():
+                shutil.rmtree(tmp_dir)
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            safetensors.torch.save_file(state_dict, str(tmp_dir / "model.safetensors"))
+
+    if is_main:
+        if projection_head is not None:
+            save_projection_head(projection_head, tmp_dir / "projection_head.safetensors")
+
+        torch.save(optimizer.state_dict(), tmp_dir / "optimizer.pt")
+
+        metadata = {
+            "epoch": epoch,
+            "global_step": global_step,
+            "best_reward": best_reward,
+            "rl_config": dataclasses.asdict(rl_config),
+            "timestamp": time.time(),
+        }
+        torch.save(metadata, tmp_dir / "metadata.pt")
+
+        if ckpt_dir.exists():
+            shutil.rmtree(ckpt_dir)
+        tmp_dir.rename(ckpt_dir)
+        logging.info(f"Saved FSDP checkpoint at epoch {epoch} -> {ckpt_dir}")
+
+    dist.barrier()
+
+
+def load_fsdp_checkpoint(
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    checkpoint_dir: pathlib.Path,
+    device: torch.device,
+    projection_head: ActionProjectionHead | None = None,
+) -> tuple[int, float]:
+    """FSDP-aware checkpoint load.
+
+    All ranks load the full state dict into the sharded model.
+    """
+    if not checkpoint_dir.exists():
+        return 0, -float("inf")
+
+    epoch_dirs = [d for d in checkpoint_dir.iterdir() if d.is_dir() and d.name.startswith("epoch_")]
+    if not epoch_dirs:
+        return 0, -float("inf")
+
+    latest_dir = max(epoch_dirs, key=lambda d: int(d.name.split("_")[1]))
+
+    # Load model via FSDP FULL_STATE_DICT
+    model_path = latest_dir / "model.safetensors"
+    if model_path.exists():
+        load_policy = FullStateDictConfig(offload_to_cpu=True)
+        with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, load_policy):
+            state_dict = safetensors.torch.load_file(str(model_path), device="cpu")
+            model.load_state_dict(state_dict)
+        logging.info(f"Loaded FSDP model from {model_path}")
+
+    if projection_head is not None:
+        head_path = latest_dir / "projection_head.safetensors"
+        if head_path.exists():
+            load_projection_head(projection_head, head_path)
+
+    optimizer_path = latest_dir / "optimizer.pt"
+    if optimizer_path.exists():
+        optimizer.load_state_dict(torch.load(optimizer_path, map_location=device, weights_only=False))
+
+    metadata_path = latest_dir / "metadata.pt"
+    if metadata_path.exists():
+        metadata = torch.load(metadata_path, map_location=device, weights_only=False)
+        epoch = metadata.get("epoch", 0)
+        best_reward = metadata.get("best_reward", -float("inf"))
+        logging.info(f"Resumed from epoch {epoch}, best_reward={best_reward:.4f}")
+        return epoch, best_reward
+
+    return 0, -float("inf")
+
 
 # ---------------------------------------------------------------------------
 # Offline GRPO Config
@@ -200,17 +357,31 @@ def train_loop(rl_config: OfflineGRPOConfig):
         logging.info(f"Reward stats: {reward_stats}")
 
     # ── Build model ──
-    model: PI0Pytorch = build_model(base_config, device)
+    # When using FSDP, build on CPU first — the full model doesn't fit in
+    # one GPU (that's the whole point of FSDP).  FSDP wrapping will move
+    # shards to the local GPU.
+    build_device = torch.device("cpu") if use_ddp else device
+    model: PI0Pytorch = build_model(base_config, build_device)
 
     # Load SFT weights if starting fresh
     if not resuming and base_config.pytorch_weight_path is not None:
         model_path = os.path.join(base_config.pytorch_weight_path, "model.safetensors")
         if os.path.exists(model_path):
-            safetensors.torch.load_model(get_model(model), model_path)
+            safetensors.torch.load_model(get_model(model), model_path, device=str(build_device))
             logging.info(f"Loaded SFT weights from {model_path}")
 
-    # DDP wrapping
-    if use_ddp:
+    # Freeze VLM (PaliGemma) — only train action expert
+    _base_model = get_model(model)
+    if getattr(_base_model, "_lora_injected", False):
+        _base_model.freeze_vlm_only()
+        trainable, total = _base_model.count_trainable_params()
+        logging.info(f"Froze VLM: {trainable / 1e6:.2f}M trainable / {total / 1e6:.2f}M total")
+
+    # FSDP wrapping (shards params/grads/optim across GPUs)
+    if use_ddp and _HAS_FSDP:
+        model = wrap_model_fsdp(model, device)
+    elif use_ddp:
+        # Fallback to DDP if FSDP not available
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[device.index] if device.type == "cuda" else None,
@@ -284,9 +455,14 @@ def train_loop(rl_config: OfflineGRPOConfig):
     best_reward = -float("inf")
     global_step = 0
     if resuming:
-        start_epoch, best_reward = load_rl_checkpoint(
-            model, optimizer, rl_ckpt_dir, device, projection_head=projection_head
-        )
+        if use_ddp and _HAS_FSDP:
+            start_epoch, best_reward = load_fsdp_checkpoint(
+                model, optimizer, rl_ckpt_dir, device, projection_head=projection_head
+            )
+        else:
+            start_epoch, best_reward = load_rl_checkpoint(
+                model, optimizer, rl_ckpt_dir, device, projection_head=projection_head
+            )
         for _ in range(start_epoch * rl_config.num_train_steps_per_epoch):
             scheduler.step()
         global_step = start_epoch * rl_config.num_train_steps_per_epoch
@@ -471,17 +647,18 @@ def train_loop(rl_config: OfflineGRPOConfig):
         if (epoch + 1) % rl_config.save_interval == 0:
             if is_main:
                 logging.info(f"Saving checkpoint at epoch {epoch + 1}...")
-            save_rl_checkpoint(
-                model,
-                optimizer,
-                epoch + 1,
-                global_step,
-                rl_config,
-                base_config,
-                best_reward,
-                is_main,
-                projection_head=projection_head,
-            )
+            if use_ddp and _HAS_FSDP:
+                save_fsdp_checkpoint(
+                    model, optimizer, epoch + 1, global_step,
+                    rl_config, base_config, best_reward, is_main,
+                    projection_head=projection_head,
+                )
+            else:
+                save_rl_checkpoint(
+                    model, optimizer, epoch + 1, global_step,
+                    rl_config, base_config, best_reward, is_main,
+                    projection_head=projection_head,
+                )
 
         # Track best model by mean episode reward
         mean_ep_reward = float(np.mean(rewards))
@@ -491,24 +668,32 @@ def train_loop(rl_config: OfflineGRPOConfig):
                 logging.info(f"New best reward: {best_reward:.4f}")
                 best_dir = base_config.checkpoint_dir / "rl_grpo_offline" / "best"
                 best_dir.mkdir(parents=True, exist_ok=True)
-                safetensors.torch.save_model(get_model(model), best_dir / "model.safetensors")
+                if use_ddp and _HAS_FSDP:
+                    save_policy = FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+                    with FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, save_policy):
+                        sd = model.state_dict()
+                        if is_main:
+                            safetensors.torch.save_file(sd, str(best_dir / "model.safetensors"))
+                else:
+                    safetensors.torch.save_model(get_model(model), best_dir / "model.safetensors")
                 if projection_head is not None:
                     save_projection_head(projection_head, best_dir / "projection_head.safetensors")
 
     # Final save
     if is_main:
         logging.info("Training complete. Saving final checkpoint...")
-    save_rl_checkpoint(
-        model,
-        optimizer,
-        rl_config.total_epochs,
-        global_step,
-        rl_config,
-        base_config,
-        best_reward,
-        is_main,
-        projection_head=projection_head,
-    )
+    if use_ddp and _HAS_FSDP:
+        save_fsdp_checkpoint(
+            model, optimizer, rl_config.total_epochs, global_step,
+            rl_config, base_config, best_reward, is_main,
+            projection_head=projection_head,
+        )
+    else:
+        save_rl_checkpoint(
+            model, optimizer, rl_config.total_epochs, global_step,
+            rl_config, base_config, best_reward, is_main,
+            projection_head=projection_head,
+        )
 
     if is_main:
         writer.add_scalar("best_reward", best_reward, global_step)

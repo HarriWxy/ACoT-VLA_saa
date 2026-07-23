@@ -66,9 +66,10 @@ class LoRALinear(nn.Module):
         # Base forward (frozen)
         result = self.base_linear(x)
 
-        # LoRA forward (trainable)
-        lora_out = self.dropout(x) @ self.lora_A.T  # (..., rank)
-        lora_out = lora_out @ self.lora_B.T          # (..., out_features)
+        # LoRA forward (trainable) — cast to input dtype to handle bf16/fp16 inputs
+        lora_dtype = x.dtype
+        lora_out = self.dropout(x) @ self.lora_A.T.to(lora_dtype)  # (..., rank)
+        lora_out = lora_out @ self.lora_B.T.to(lora_dtype)          # (..., out_features)
         result = result + lora_out * self.config.scaling
 
         return result

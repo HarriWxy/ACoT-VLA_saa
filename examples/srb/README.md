@@ -20,7 +20,9 @@
 
 `src/openpi/serving/websocket_policy_server_sample.py`
 
-在 `serve.py` 里直接调用 `websocket_policy_server_sample.py` 的 `rollout()`，从远程 SRB 环境里采样。
+在 `serve.py` 里直接调用 `websocket_policy_server_sample.py` 的 `rollout()`，从远程 SRB 环境里采样。(加载 Jax 模型)
+
+`serve_pytorch.py` 里调用 pytorch 模型 rollout, 采集数据。
 
 ## 推理
 

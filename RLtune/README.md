@@ -438,6 +438,27 @@ model=pi0_config.Pi0Config(
 
 **norm_stats 不变** — 它只依赖数据集，不依赖模型。
 
+## 双卡
+
+FSDP 双卡显存共享已全部实现完毕：
+
+1. **train_offline.py**：
+   - `wrap_model_fsdp()` — FULL_SHARD 策略 + bf16 混合精度
+   - `save_fsdp_checkpoint()` / `load_fsdp_checkpoint()` — 完整状态收集/加载
+   - 模型在 CPU 上构建，FSDP 自动分片到 2 张卡
+
+2. **train_pytorch.py**：
+   - `get_model()` 自动解包 FSDP 包装器
+
+### 启动方式
+
+```bash
+torchrun --nproc_per_node=2 RLtune/train_offline.py [原有参数...]
+```
+
+FSDP 会自动将模型参数、梯度、优化器状态分片到两张卡上，每张卡只需约 50% 的显存。 
+
+
 ---
 
 ## 快速检查清单
