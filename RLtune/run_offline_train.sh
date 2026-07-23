@@ -35,6 +35,7 @@ FILTER_ACC="${FILTER_ACC:-true}"                    # Enable accuracy filtering
 
 # ── XLA / CUDA settings ──
 export XLA_PYTHON_CLIENT_MEM_FRACTION="${XLA_PYTHON_CLIENT_MEM_FRACTION:-0.85}"
+export XLA_PYTHON_CLIENT_PREALLOCATE="${XLA_PYTHON_CLIENT_PREALLOCATE:-false}"
 export TOKENIZERS_PARALLELISM=false
 
 # ── Build filter flag ──
@@ -79,11 +80,11 @@ cd "$(dirname "$0")/.."
 
 if [ "${NPROC}" -gt 1 ]; then
     echo "Launching with torchrun (${NPROC} GPUs)..."
-    torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
+    uv run torchrun --standalone --nnodes=1 --nproc_per_node="${NPROC}" \
         -m RLtune.train_offline \
         "${COMMON_ARGS[@]}"
 else
     echo "Launching single GPU..."
-    python -m RLtune.train_offline \
+    uv run python -m RLtune.train_offline \
         "${COMMON_ARGS[@]}"
 fi

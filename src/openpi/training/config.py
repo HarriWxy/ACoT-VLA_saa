@@ -640,6 +640,7 @@ class TrainConfig:
     assets_base_dir: str = "./assets"
     # Base directory for checkpoints.
     checkpoint_base_dir: str = "./checkpoints"
+    checkpoint_dir_override: tyro.conf.Suppress[pathlib.Path | None] = None
 
     # Random seed that will be used by random generators during training.
     seed: int = 42
@@ -683,6 +684,8 @@ class TrainConfig:
     @property
     def checkpoint_dir(self) -> pathlib.Path:
         """Get the checkpoint directory for this config."""
+        if self.checkpoint_dir_override is not None:
+            return self.checkpoint_dir_override.expanduser().resolve()
         if not self.exp_name:
             raise ValueError("--exp_name must be set")
         return (pathlib.Path(self.checkpoint_base_dir) / self.name / self.exp_name).resolve()

@@ -70,7 +70,7 @@ class LoRALinear(nn.Module):
         lora_dtype = x.dtype
         lora_out = self.dropout(x) @ self.lora_A.T.to(lora_dtype)  # (..., rank)
         lora_out = lora_out @ self.lora_B.T.to(lora_dtype)          # (..., out_features)
-        result = result + lora_out * self.config.scaling
+        result.add_(lora_out, alpha=self.config.scaling)
 
         return result
 

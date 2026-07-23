@@ -325,22 +325,42 @@ class PI0Pytorch(nn.Module):
             )
         return func(*args, **kwargs)
 
-    def _prepare_attention_masks_4d(self, att_2d_masks):
-        """Helper method to prepare 4D attention masks for transformer."""
-        att_2d_masks_4d = att_2d_masks[:, None, :, :]
-        return torch.where(att_2d_masks_4d, 0.0, -2.3819763e38)
+    def _prepare_attention_masks_4d(self, att_2d_masks, *, dtype=torch.float32):
+        """Prepare a 4D additive attention mask in the requested dtype."""
+        att_2d_masks_4d = att_2d_masks[:, None, :, :]  # [B, 1, S, S] bool
+        masked_value = -2.3819763e38 if dtype == torch.float32 else torch.finfo(dtype).min
+        return torch.where(
+            att_2d_masks_4d,
+            torch.zeros((), dtype=dtype, device=att_2d_masks.device),
+            torch.full((), masked_value, dtype=dtype, device=att_2d_masks.device),
+        )
 
-    def _prepare_attention_masks_for_gemma4(self, att_2d_masks, sliding_window=512):
-        """Prepare both full causal and sliding window 4D masks for Gemma 4."""
-        full_mask = self._prepare_attention_masks_4d(att_2d_masks)
-        # Sliding window: additionally mask positions outside the window
+    def _prepare_attention_masks_for_gemma4(self, att_2d_masks, sliding_window=512, *, dtype=torch.bfloat16):
+        """Prepare full causal and sliding-window masks for Gemma 4.
+
+        Masks use bf16 to halve their persistent footprint relative to float32.
+
+        Returns dict with:
+          - "full_attention": [B, 1, S, S] bf16 mask
+          - "sliding_attention": [B, 1, S, S] bf16 mask, or the full mask when
+            the sequence fits entirely within the sliding window
+        """
+        full_mask = self._prepare_attention_masks_4d(att_2d_masks, dtype=dtype)
         seq_len = att_2d_masks.shape[-1]
-        position_ids_q = torch.arange(seq_len, device=att_2d_masks.device)[:, None]
-        position_ids_k = torch.arange(seq_len, device=att_2d_masks.device)[None, :]
-        sliding_mask_2d = (position_ids_q - position_ids_k) <= sliding_window
-        combined_2d = att_2d_masks & sliding_mask_2d
-        sliding_mask = self._prepare_attention_masks_4d(combined_2d)
-        return {"full_attention": full_mask, "sliding_attention": sliding_mask}
+
+        if seq_len <= sliding_window:
+            sliding_mask = full_mask  # Same tensor — zero extra memory
+        else:
+            position_ids_q = torch.arange(seq_len, device=att_2d_masks.device)[:, None]
+            position_ids_k = torch.arange(seq_len, device=att_2d_masks.device)[None, :]
+            sliding_window_2d = (position_ids_q - position_ids_k) <= sliding_window
+            combined_2d = att_2d_masks & sliding_window_2d
+            sliding_mask = self._prepare_attention_masks_4d(combined_2d, dtype=dtype)
+            del combined_2d, position_ids_k, position_ids_q, sliding_window_2d
+        return {
+            "full_attention": full_mask,
+            "sliding_attention": sliding_mask,
+        }
 
     def _preprocess_observation(self, observation, *, train=True):
         """Helper method to preprocess observation."""
@@ -533,7 +553,9 @@ class PI0Pytorch(nn.Module):
         # Prepare attention masks (Gemma 4 needs dual masks: full + sliding window)
         if self._is_gemma4:
             sliding_window = self.paligemma_with_expert.gemma4_vlm.model.config.sliding_window
-            att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(att_2d_masks, sliding_window)
+            att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(
+                att_2d_masks, sliding_window, dtype=prefix_embs.dtype
+            )
         else:
             att_2d_masks_4d = self._prepare_attention_masks_4d(att_2d_masks)
 
@@ -581,7 +603,9 @@ class PI0Pytorch(nn.Module):
         # Compute image and language key value cache
         if self._is_gemma4:
             sliding_window = self.paligemma_with_expert.gemma4_vlm.model.config.sliding_window
-            prefix_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(prefix_att_2d_masks, sliding_window)
+            prefix_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(
+                prefix_att_2d_masks, sliding_window, dtype=prefix_embs.dtype
+            )
         else:
             prefix_att_2d_masks_4d = self._prepare_attention_masks_4d(prefix_att_2d_masks)
             self.paligemma_with_expert.paligemma.language_model.config._attn_implementation = "eager"  # noqa: SLF001
@@ -665,7 +689,9 @@ class PI0Pytorch(nn.Module):
             position_ids = prefix_offsets + torch.cumsum(suffix_pad_masks, dim=1) - 1
 
             sliding_window = self.paligemma_with_expert.gemma4_vlm.model.config.sliding_window
-            full_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(full_att_2d_masks, sliding_window)
+            full_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(
+                full_att_2d_masks, sliding_window, dtype=suffix_embs.dtype
+            )
             self.paligemma_with_expert.gemma4_expert.model.config._attn_implementation = "eager"  # noqa: SLF001
 
             outputs_embeds, _ = self.paligemma_with_expert.forward(
@@ -696,7 +722,9 @@ class PI0Pytorch(nn.Module):
             position_ids = torch.cumsum(full_pad_masks, dim=1) - 1
 
             sliding_window = self.paligemma_with_expert.gemma4_vlm.model.config.sliding_window
-            full_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(full_att_2d_masks, sliding_window)
+            full_att_2d_masks_4d = self._prepare_attention_masks_for_gemma4(
+                full_att_2d_masks, sliding_window, dtype=prefix_embs.dtype
+            )
 
             outputs_embeds, _ = self.paligemma_with_expert.forward(
                 attention_mask=full_att_2d_masks_4d,

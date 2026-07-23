@@ -18,6 +18,7 @@ Key differences from Gemma 2 based gemma_pytorch.py:
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import types
 from typing import Literal
@@ -34,8 +35,6 @@ def _get_weight(module: nn.Module) -> torch.Tensor:
     """获取模块权重, 兼容 LoRALinear (权重在 base_linear.weight)。"""
     return module.base_linear.weight if hasattr(module, "base_linear") else module.weight
 from transformers.models.gemma4.modeling_gemma4 import repeat_kv
-import numpy as np
-from PIL import Image
 
 
 def _make_layer_types(num_layers: int, pattern: int = 6) -> list[str]:
@@ -279,29 +278,30 @@ class Gemma4WithExpertModel(nn.Module):
         """Embed images using Gemma-4 native vision encoder.
 
         Args:
-            images: PIL Image(s) or tensor. If PIL, processed via image_processor.
-                    If tensor of shape (B, C, H, W), assumed already preprocessed.
+            images: PIL Image(s) or a tensor of shape (B, C, H, W). Floating-point
+                tensors may use [-1, 1], [0, 1], or [0, 255] values.
 
         Returns:
             Image embeddings of shape (B, num_tokens, vlm_hidden_size).
         """
         if isinstance(images, torch.Tensor):
-            # images is already a tensor: convert to PIL for image_processor
-            # tensor shape: (B, C, H, W), values in [0, 1] or [0, 255]
-            if images.dim() == 4:
-                images_np = images.detach().cpu().to(torch.float32)
-                if images_np.max() <= 1.0:
-                    images_np = images_np * 255.0
-                images_np = images_np.permute(0, 2, 3, 1).numpy().astype(np.uint8)
-                pil_images = [Image.fromarray(img_np) for img_np in images_np]
-            else:
+            if images.dim() != 4:
                 raise ValueError(f"Expected 4D tensor (B,C,H,W), got shape {images.shape}")
+            processor_images = images.detach().to(dtype=torch.float32)
+            if images.is_floating_point():
+                image_min = processor_images.amin()
+                if image_min < 0:
+                    processor_images = (processor_images + 1.0) * 127.5
+                elif processor_images.amax() <= 1.0:
+                    processor_images = processor_images * 255.0
+            processor_batch_size = images.shape[0]
         else:
             # Already PIL Image(s)
-            pil_images = images if isinstance(images, list) else [images]
+            processor_images = images if isinstance(images, list) else [images]
+            processor_batch_size = len(processor_images)
 
         # Process through image processor → pixel_values (B, N, 768), position_ids (B, N, 2)
-        inputs = self.image_processor(images=pil_images, return_tensors="pt")
+        inputs = self.image_processor(images=processor_images, return_tensors="pt")
         pixel_values = inputs["pixel_values"].to(device=self.vision_tower.device, dtype=self.vision_tower.dtype)
         position_ids = inputs["image_position_ids"].to(device=self.vision_tower.device)
 
@@ -311,7 +311,7 @@ class Gemma4WithExpertModel(nn.Module):
                 pixel_values=pixel_values,
                 pixel_position_ids=position_ids,
             )
-        batch_size = len(pil_images)
+        batch_size = processor_batch_size
         # The vision tower output may not be batched: handle (N, D) vs (B, N, D)
         vision_features = vision_out.last_hidden_state
         if vision_features.dim() == 2:
@@ -383,7 +383,6 @@ class Gemma4WithExpertModel(nn.Module):
     ):
         """Joint attention forward pass for both VLM and action expert."""
         from transformers.models.gemma4.modeling_gemma4 import apply_rotary_pos_emb
-        from transformers.models.gemma4.modeling_gemma4 import eager_attention_forward
 
         vlm_model = self.gemma4_vlm.model
         expert_model = self.gemma4_expert.model
@@ -393,10 +392,21 @@ class Gemma4WithExpertModel(nn.Module):
         # Handle attention mask: accept either single tensor or dict of masks
         if isinstance(attention_mask, dict):
             full_mask = attention_mask.get("full_attention")
-            sliding_mask = attention_mask.get("sliding_attention")
+            sliding_mask = attention_mask.get("sliding_attention", full_mask)
         else:
             full_mask = attention_mask
             sliding_mask = attention_mask
+
+        # SDPA requires an additive mask to match the query dtype. Preserve the
+        # shared-mask alias so short sequences still retain only one mask tensor.
+        masks_are_shared = sliding_mask is full_mask
+        attention_dtype = inputs_embeds[0].dtype
+        if full_mask is not None and full_mask.dtype not in (torch.bool, attention_dtype):
+            full_mask = full_mask.to(dtype=attention_dtype)
+        if masks_are_shared:
+            sliding_mask = full_mask
+        elif sliding_mask is not None and sliding_mask.dtype not in (torch.bool, attention_dtype):
+            sliding_mask = sliding_mask.to(dtype=attention_dtype)
 
         # Check gradient checkpointing
         use_gradient_checkpointing = (
@@ -417,6 +427,21 @@ class Gemma4WithExpertModel(nn.Module):
                 hidden_states_dummy, position_ids, layer_type
             )
 
+        # In offline RL the VLM can be fully frozen while the action expert remains trainable.
+        # Prefix tokens cannot attend to suffix tokens, so the VLM branch can be evaluated
+        # without autograd and the suffix branch can attend to its detached K/V states.
+        # vlm_is_frozen is an invariant flag (only checks param state, not inputs) so it
+        # remains correct during gradient-checkpoint recomputation where
+        # inputs_embeds.requires_grad flips to True.
+        vlm_is_frozen = not any(param.requires_grad for param in vlm_model.parameters())
+        frozen_vlm_path = vlm_is_frozen and (
+            adarms_cond[0] is None or not adarms_cond[0].requires_grad
+        )
+        # When VLM is frozen, wrap all VLM computation in torch.no_grad() to prevent
+        # autograd from saving intermediate activations (LoRA A/B matmuls, MLP, layernorms).
+        # This is the primary memory saving during backward checkpoint recomputation.
+        _vlm_ctx = torch.no_grad if vlm_is_frozen else contextlib.nullcontext
+
         def compute_layer_complete(
             layer_idx, vlm_hidden, expert_hidden, full_mask, sliding_mask, position_embeddings, adarms_cond
         ):
@@ -427,25 +452,22 @@ class Gemma4WithExpertModel(nn.Module):
             mask = sliding_mask if layer_type == "sliding_attention" else full_mask
             cos, sin = position_embeddings[layer_type]
 
-            # --- Input LayerNorm + optional adarms ---
-            vlm_ln_out = vlm_layer.input_layernorm(vlm_hidden)
+            # --- Input LayerNorm + Q/K/V projection ---
+            # VLM branch: no_grad when frozen to avoid storing LoRA intermediates
+            with _vlm_ctx():
+                vlm_ln_out = vlm_layer.input_layernorm(vlm_hidden)
+                vlm_h, vlm_gate = (vlm_ln_out if isinstance(vlm_ln_out, tuple) else (vlm_ln_out, None))
+                input_shape_vlm = vlm_h.shape[:-1]
+                hidden_shape_vlm = (*input_shape_vlm, -1, vlm_layer.self_attn.head_dim)
+                vlm_q = vlm_layer.self_attn.q_norm(vlm_layer.self_attn.q_proj(vlm_h).view(hidden_shape_vlm))
+                vlm_k = vlm_layer.self_attn.k_norm(vlm_layer.self_attn.k_proj(vlm_h).view(hidden_shape_vlm))
+                vlm_v = vlm_layer.self_attn.v_norm(vlm_layer.self_attn.v_proj(vlm_h).view(hidden_shape_vlm))
+
+            # Expert branch: always with grad
             expert_ln_out = expert_layer.input_layernorm(expert_hidden)
-            # Handle adarms returns (normed, gate) vs standard (normed,)
-            vlm_h, vlm_gate = (vlm_ln_out if isinstance(vlm_ln_out, tuple) else (vlm_ln_out, None))
             expert_h, expert_gate = (expert_ln_out if isinstance(expert_ln_out, tuple) else (expert_ln_out, None))
-
-            input_shape_vlm = vlm_h.shape[:-1]
             input_shape_expert = expert_h.shape[:-1]
-            hidden_shape_vlm = (*input_shape_vlm, -1, vlm_layer.self_attn.head_dim)
             hidden_shape_expert = (*input_shape_expert, -1, expert_layer.self_attn.head_dim)
-
-            # Q/K/V projection + Q/K/V norms
-            # Q: [batch, seq, num_attention_heads, head_dim]
-            # K/V: [batch, seq, num_kv_heads, head_dim] (may differ between models)
-            vlm_q = vlm_layer.self_attn.q_norm(vlm_layer.self_attn.q_proj(vlm_h).view(hidden_shape_vlm))
-            vlm_k = vlm_layer.self_attn.k_norm(vlm_layer.self_attn.k_proj(vlm_h).view(hidden_shape_vlm))
-            vlm_v = vlm_layer.self_attn.v_norm(vlm_layer.self_attn.v_proj(vlm_h).view(hidden_shape_vlm))
-
             expert_q = expert_layer.self_attn.q_norm(expert_layer.self_attn.q_proj(expert_h).view(hidden_shape_expert))
             expert_k = expert_layer.self_attn.k_norm(expert_layer.self_attn.k_proj(expert_h).view(hidden_shape_expert))
             expert_v = expert_layer.self_attn.v_norm(expert_layer.self_attn.v_proj(expert_h).view(hidden_shape_expert))
@@ -463,34 +485,93 @@ class Gemma4WithExpertModel(nn.Module):
                     expert_k = repeat_kv(expert_k.permute(0, 2, 1, 3), target_kv_heads // expert_kv_heads).permute(0, 2, 1, 3)
                     expert_v = repeat_kv(expert_v.permute(0, 2, 1, 3), target_kv_heads // expert_kv_heads).permute(0, 2, 1, 3)
 
-            # Concatenate along sequence dimension, then apply RoPE
-            # (position_ids cover the full combined sequence)
-            query_states = torch.cat([vlm_q, expert_q], dim=1)  # [batch, seq, heads, head_dim]
-            key_states = torch.cat([vlm_k, expert_k], dim=1)
-            value_states = torch.cat([vlm_v, expert_v], dim=1)
+            vlm_seq_len = vlm_hidden.shape[1]
+            if frozen_vlm_path:
+                vlm_cos, vlm_sin = cos[:, :vlm_seq_len], sin[:, :vlm_seq_len]
+                expert_cos, expert_sin = cos[:, vlm_seq_len:], sin[:, vlm_seq_len:]
 
-            query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
-            key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
-            value_states = value_states.transpose(1, 2)
+                vlm_query_states = apply_rotary_pos_emb(
+                    vlm_q, vlm_cos, vlm_sin, unsqueeze_dim=2
+                ).transpose(1, 2)
+                vlm_key_states = apply_rotary_pos_emb(
+                    vlm_k, vlm_cos, vlm_sin, unsqueeze_dim=2
+                ).transpose(1, 2)
+                vlm_value_states = vlm_v.transpose(1, 2)
+                expert_query_states = apply_rotary_pos_emb(
+                    expert_q, expert_cos, expert_sin, unsqueeze_dim=2
+                ).transpose(1, 2)
+                expert_key_states = apply_rotary_pos_emb(
+                    expert_k, expert_cos, expert_sin, unsqueeze_dim=2
+                ).transpose(1, 2)
+                expert_value_states = expert_v.transpose(1, 2)
 
-            # GQA: expand KV heads to match Q heads if needed
-            # After transpose: [batch, num_heads, seq, head_dim]
-            # num_attention_heads (Q=8) may differ from num_kv_heads (K/V=4)
-            num_q_heads = query_states.shape[1]
-            num_kv_heads = key_states.shape[1]
-            if num_kv_heads != num_q_heads:
-                n_rep = num_q_heads // num_kv_heads
-                key_states = repeat_kv(key_states, n_rep)
-                value_states = repeat_kv(value_states, n_rep)
+                num_q_heads = vlm_query_states.shape[1]
+                if vlm_key_states.shape[1] != num_q_heads:
+                    vlm_kv_repeat = num_q_heads // vlm_key_states.shape[1]
+                    vlm_key_states = repeat_kv(vlm_key_states, vlm_kv_repeat)
+                    vlm_value_states = repeat_kv(vlm_value_states, vlm_kv_repeat)
+                if expert_key_states.shape[1] != num_q_heads:
+                    expert_kv_repeat = num_q_heads // expert_key_states.shape[1]
+                    expert_key_states = repeat_kv(expert_key_states, expert_kv_repeat)
+                    expert_value_states = repeat_kv(expert_value_states, expert_kv_repeat)
 
-            batch_size = query_states.shape[0]
+                with torch.no_grad():
+                    vlm_att_output = torch.nn.functional.scaled_dot_product_attention(
+                        vlm_query_states,
+                        vlm_key_states,
+                        vlm_value_states,
+                        attn_mask=None if mask is None else mask[:, :, :vlm_seq_len, :vlm_seq_len],
+                        dropout_p=0.0,
+                        scale=1.0,
+                    )
 
-            # Manual attention
-            attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
-            if mask is not None:
-                attn_weights = attn_weights + mask
-            attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-            att_output = torch.matmul(attn_weights, value_states)
+                expert_key_states = torch.cat([vlm_key_states.detach(), expert_key_states], dim=2)
+                expert_value_states = torch.cat([vlm_value_states.detach(), expert_value_states], dim=2)
+                expert_att_output = torch.nn.functional.scaled_dot_product_attention(
+                    expert_query_states,
+                    expert_key_states,
+                    expert_value_states,
+                    attn_mask=None if mask is None else mask[:, :, vlm_seq_len:, :],
+                    dropout_p=0.0,
+                    scale=1.0,
+                )
+                att_output = torch.cat([vlm_att_output, expert_att_output], dim=2)
+                batch_size = expert_query_states.shape[0]
+            else:
+                # Concatenate along sequence dimension, then apply RoPE
+                # (position_ids cover the full combined sequence)
+                query_states = torch.cat([vlm_q, expert_q], dim=1)  # [batch, seq, heads, head_dim]
+                key_states = torch.cat([vlm_k, expert_k], dim=1)
+                value_states = torch.cat([vlm_v, expert_v], dim=1)
+
+                query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
+                key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
+                value_states = value_states.transpose(1, 2)
+
+                # GQA: expand KV heads to match Q heads if needed
+                # After transpose: [batch, num_heads, seq, head_dim]
+                # num_attention_heads (Q=8) may differ from num_kv_heads (K/V=4)
+                num_q_heads = query_states.shape[1]
+                num_kv_heads = key_states.shape[1]
+                if num_kv_heads != num_q_heads:
+                    n_rep = num_q_heads // num_kv_heads
+                    key_states = repeat_kv(key_states, n_rep)
+                    value_states = repeat_kv(value_states, n_rep)
+
+                batch_size = query_states.shape[0]
+
+                # On supported CUDA backends, SDPA selects a fused memory-efficient
+                # kernel for this dense prefix-LM mask and avoids materializing the
+                # [B, H, S, S] attention-weight tensor.
+                # scale=1.0 preserves the pre-existing joint-attention calculation.
+                att_output = torch.nn.functional.scaled_dot_product_attention(
+                    query_states,
+                    key_states,
+                    value_states,
+                    attn_mask=mask,
+                    dropout_p=0.0,
+                    scale=1.0,
+                )
             att_output = att_output.transpose(1, 2).contiguous()
 
             head_dim = vlm_layer.self_attn.head_dim
@@ -501,17 +582,28 @@ class Gemma4WithExpertModel(nn.Module):
             vlm_att_out = att_output[:, :vlm_seq_len]
             expert_att_out = att_output[:, vlm_seq_len:]
 
-            # --- VLM: o_proj + post_attn_norm + residual ---
-            if vlm_att_out.dtype != _get_weight(vlm_layer.self_attn.o_proj).dtype:
-                vlm_att_out = vlm_att_out.to(_get_weight(vlm_layer.self_attn.o_proj).dtype)
-            vlm_att_out = vlm_layer.self_attn.o_proj(vlm_att_out)
-            vlm_post_attn = vlm_layer.post_attention_layernorm(vlm_att_out)
-            vlm_post_attn, vlm_post_gate = (
-                vlm_post_attn if isinstance(vlm_post_attn, tuple) else (vlm_post_attn, None)
-            )
-            vlm_hidden = _gated_residual(vlm_hidden, vlm_post_attn, vlm_gate or vlm_post_gate)
+            # --- VLM: o_proj + post_attn_norm + residual + MLP (no_grad if frozen) ---
+            with _vlm_ctx():
+                if vlm_att_out.dtype != _get_weight(vlm_layer.self_attn.o_proj).dtype:
+                    vlm_att_out = vlm_att_out.to(_get_weight(vlm_layer.self_attn.o_proj).dtype)
+                if frozen_vlm_path:
+                    vlm_att_out = vlm_att_out.detach()
+                vlm_att_out = vlm_layer.self_attn.o_proj(vlm_att_out)
+                vlm_post_attn = vlm_layer.post_attention_layernorm(vlm_att_out)
+                vlm_post_attn, vlm_post_gate = (
+                    vlm_post_attn if isinstance(vlm_post_attn, tuple) else (vlm_post_attn, None)
+                )
+                vlm_hidden = _gated_residual(vlm_hidden, vlm_post_attn, vlm_gate or vlm_post_gate)
 
-            # --- Expert: o_proj + post_attn_norm + residual ---
+                residual = vlm_hidden
+                vlm_ff = vlm_layer.pre_feedforward_layernorm(vlm_hidden)
+                vlm_ff = vlm_layer.mlp(vlm_ff)
+                vlm_ff = vlm_layer.post_feedforward_layernorm(vlm_ff)
+                vlm_hidden = residual + vlm_ff
+
+                vlm_hidden = vlm_hidden * vlm_layer.layer_scalar
+
+            # --- Expert: o_proj + post_attn_norm + residual + MLP ---
             if expert_att_out.dtype != _get_weight(expert_layer.self_attn.o_proj).dtype:
                 expert_att_out = expert_att_out.to(_get_weight(expert_layer.self_attn.o_proj).dtype)
             expert_att_out = expert_layer.self_attn.o_proj(expert_att_out)
@@ -521,22 +613,12 @@ class Gemma4WithExpertModel(nn.Module):
             )
             expert_hidden = _gated_residual(expert_hidden, expert_post_attn, expert_gate or expert_post_gate)
 
-            # --- VLM: MLP with pre/post feedforward norms ---
-            residual = vlm_hidden
-            vlm_ff = vlm_layer.pre_feedforward_layernorm(vlm_hidden)
-            vlm_ff = vlm_layer.mlp(vlm_ff)
-            vlm_ff = vlm_layer.post_feedforward_layernorm(vlm_ff)
-            vlm_hidden = residual + vlm_ff
-
-            # --- Expert: MLP with pre/post feedforward norms ---
             residual = expert_hidden
             expert_ff = expert_layer.pre_feedforward_layernorm(expert_hidden)
             expert_ff = expert_layer.mlp(expert_ff)
             expert_ff = expert_layer.post_feedforward_layernorm(expert_ff)
             expert_hidden = residual + expert_ff
 
-            # --- Layer scalar ---
-            vlm_hidden = vlm_hidden * vlm_layer.layer_scalar
             expert_hidden = expert_hidden * expert_layer.layer_scalar
 
             return vlm_hidden, expert_hidden

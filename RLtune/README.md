@@ -419,6 +419,12 @@ class YourEnvRewardManager:
         return np.array(rewards), {"success_rate": np.mean([t.success for t in trajectories])}
 ```
 
+## 加载数据集
+
+```bash
+mkdir -p /home/omnisky/.cache/huggingface/lerobot && ln -s /media/omnisky/sda/algos/R2A/Algos/ACoT-VLA_saa/dataset/srb_dataset /home/omnisky/.cache/huggingface/lerobot/srb_dataset && echo "符号链接创建成功" && ls -la /home/omnisky/.cache/huggingface/lerobot/srb_dataset
+```
+
 ---
 
 ## 如果使用 Gemma 4 E2B

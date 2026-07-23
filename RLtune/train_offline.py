@@ -319,7 +319,7 @@ def train_loop(rl_config: OfflineGRPOConfig):
     if rl_config.checkpoint_dir:
         base_config = dataclasses.replace(
             base_config,
-            checkpoint_dir=pathlib.Path(rl_config.checkpoint_dir),
+            checkpoint_dir_override=pathlib.Path(rl_config.checkpoint_dir),
         )
 
     rl_ckpt_dir = base_config.checkpoint_dir / "rl_grpo"
