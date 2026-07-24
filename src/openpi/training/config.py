@@ -1150,10 +1150,7 @@ _CONFIGS = [
                             "action": "action",
                             "reward": "reward",
                             "prompt": "prompt",
-                        }
-                    )
-                ]
-            ),
+                        })]),
         ),
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20,
@@ -1170,17 +1167,10 @@ _CONFIGS = [
         ).get_freeze_filter(),
         ema_decay=None,
     ),
-    # Low-memory SRB config: gemma4_e2b VLM + gemma4_300m_tiny expert (depth=6 vs 18).
-    # Saves ~207M expert params and ~12 layers of activation memory.
-    # Note: num_layers=min(35, 6)=6, so only 6 VLM layers are processed via joint attention.
-    TrainConfig(
-        name="srb_train_gemma4_low_mem",
-        model=pi0_config.Pi0Config(
-            pi05=True, action_horizon=16, discrete_state_input=False,
-            paligemma_variant="gemma4_e2b_lora",
-            action_expert_variant="gemma4_300m_tiny_lora",
-            gemma4_model_path="./models/gemma-4-E2B",
-        ),
+    TrainConfig(  # train gemma2 on srb tracking dataset
+        name="srb_train_tracking",
+        model=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False,
+                                   paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",),
         data=SRBDataConfig(
             repo_id="srb_tracking",
             base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
@@ -1196,24 +1186,18 @@ _CONFIGS = [
                             "action": "action",
                             "reward": "reward",
                             "prompt": "prompt",
-                        }
-                    )
-                ]
-            ),
+                        })]),
         ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         num_train_steps=20,
-        batch_size=4,
-        exp_name="srb_sample_low_mem",
+        batch_size=8,
+        exp_name="srb_sample",
         save_interval=100,
         overwrite=True,
         wandb_enabled=False,
-        freeze_filter=pi0_config.Pi0Config(
-            pi05=True, action_horizon=16, discrete_state_input=False,
-            paligemma_variant="gemma4_e2b_lora",
-            action_expert_variant="gemma4_300m_tiny_lora",
-            gemma4_model_path="./models/gemma-4-E2B",
-        ).get_freeze_filter(),
-        ema_decay=None,
+        freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False,
+                    paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",).get_freeze_filter(),
+        # ema_decay=None,
     ),
     #
     # Single-step pi0.5 configs (no diffusion, direct action prediction).

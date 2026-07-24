@@ -25,16 +25,41 @@ from typing import Literal
 
 import torch
 from torch import nn
+import torch.nn.functional as F  # noqa: N812
 from transformers import AutoImageProcessor
 from transformers import Gemma4ForCausalLM
 from transformers import Gemma4ForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
+from transformers.models.gemma4.modeling_gemma4 import repeat_kv
 
 
 def _get_weight(module: nn.Module) -> torch.Tensor:
     """获取模块权重, 兼容 LoRALinear (权重在 base_linear.weight)。"""
     return module.base_linear.weight if hasattr(module, "base_linear") else module.weight
-from transformers.models.gemma4.modeling_gemma4 import repeat_kv
+
+
+def _scaled_dot_product_attention(query, key, value, attention_mask):
+    """Run SDPA while preserving the fused CUDA kernel for grouped queries."""
+    query_heads = query.shape[1]
+    key_heads = key.shape[1]
+    if query_heads % key_heads != 0:
+        raise ValueError(f"Query heads ({query_heads}) must be divisible by key heads ({key_heads})")
+
+    if query_heads != key_heads:
+        # On the tested CUDA backend, enable_gqa forces SDPA onto a less memory-
+        # efficient path. Expand once here so the regular call can use Flash
+        # or memory-efficient attention.
+        key = repeat_kv(key, query_heads // key_heads)
+        value = repeat_kv(value, query_heads // key_heads)
+
+    return F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        dropout_p=0.0,
+        scale=1.0,
+    )
 
 
 def _make_layer_types(num_layers: int, pattern: int = 6) -> list[str]:
@@ -91,7 +116,7 @@ def _adarms_norm_forward(self, hidden_states, cond=None):
         return normed.type_as(hidden_states)
 
     # Adaptive path: scale, shift, gate
-    modulation = self.adarms_dense(cond)
+    modulation = self.adarms_dense(cond.to(dtype=self.adarms_dense.weight.dtype))
     if hidden_states.ndim == 3:
         modulation = modulation.unsqueeze(1)
     scale, shift, gate = modulation.chunk(3, dim=-1)
@@ -231,11 +256,11 @@ class Gemma4WithExpertModel(nn.Module):
             "vision_tower.embeddings.patch_embedding.weight",
             "vision_tower.embeddings.patch_embedding.bias",
             "vision_tower.embeddings.position_embedding.weight",
-            "input_layernorm",
-            "post_attention_layernorm",
-            "pre_feedforward_layernorm",
-            "post_feedforward_layernorm",
-            "model.norm",
+            "input_layernorm.weight",
+            "post_attention_layernorm.weight",
+            "pre_feedforward_layernorm.weight",
+            "post_feedforward_layernorm.weight",
+            "model.norm.weight",
         ]
 
         for name, param in self.named_parameters():
@@ -462,7 +487,7 @@ class Gemma4WithExpertModel(nn.Module):
                 vlm_q = vlm_layer.self_attn.q_norm(vlm_layer.self_attn.q_proj(vlm_h).view(hidden_shape_vlm))
                 vlm_k = vlm_layer.self_attn.k_norm(vlm_layer.self_attn.k_proj(vlm_h).view(hidden_shape_vlm))
                 vlm_v = vlm_layer.self_attn.v_norm(vlm_layer.self_attn.v_proj(vlm_h).view(hidden_shape_vlm))
-                del vlm_h  # input_layernorm output consumed by Q/K/V projections
+                # del vlm_h  # input_layernorm output consumed by Q/K/V projections
 
             # Expert branch: always with grad
             expert_ln_out = expert_layer.input_layernorm(expert_hidden)
@@ -472,172 +497,126 @@ class Gemma4WithExpertModel(nn.Module):
             expert_q = expert_layer.self_attn.q_norm(expert_layer.self_attn.q_proj(expert_h).view(hidden_shape_expert))
             expert_k = expert_layer.self_attn.k_norm(expert_layer.self_attn.k_proj(expert_h).view(hidden_shape_expert))
             expert_v = expert_layer.self_attn.v_norm(expert_layer.self_attn.v_proj(expert_h).view(hidden_shape_expert))
-            del expert_h  # input_layernorm output consumed by Q/K/V projections
-
-            # Expand KV heads to match if models have different num_kv_heads
-            # repeat_kv expects [batch, num_kv_heads, seq, head_dim]
-            vlm_kv_heads = vlm_k.shape[2]
-            expert_kv_heads = expert_k.shape[2]
-            if vlm_kv_heads != expert_kv_heads:
-                target_kv_heads = max(vlm_kv_heads, expert_kv_heads)
-                if vlm_kv_heads < target_kv_heads:
-                    vlm_k = repeat_kv(vlm_k.permute(0, 2, 1, 3), target_kv_heads // vlm_kv_heads).permute(0, 2, 1, 3)
-                    vlm_v = repeat_kv(vlm_v.permute(0, 2, 1, 3), target_kv_heads // vlm_kv_heads).permute(0, 2, 1, 3)
-                if expert_kv_heads < target_kv_heads:
-                    expert_k = repeat_kv(expert_k.permute(0, 2, 1, 3), target_kv_heads // expert_kv_heads).permute(0, 2, 1, 3)
-                    expert_v = repeat_kv(expert_v.permute(0, 2, 1, 3), target_kv_heads // expert_kv_heads).permute(0, 2, 1, 3)
 
             vlm_seq_len = vlm_hidden.shape[1]
+            expert_seq_len = expert_hidden.shape[1]
+            if vlm_q.shape[2] != expert_q.shape[2]:
+                raise ValueError(
+                    "Gemma4 VLM and action expert must use the same number of query heads "
+                    f"for joint attention, got {vlm_q.shape[2]} and {expert_q.shape[2]}"
+                )
+
+            # Apply RoPE before transposing to [batch, heads, seq, head_dim].
+            # Slicing the shared position embedding avoids concatenating the two
+            # hidden-state streams before attention.
+            vlm_cos, vlm_sin = cos[:, :vlm_seq_len], sin[:, :vlm_seq_len]
+            expert_cos, expert_sin = cos[:, vlm_seq_len:], sin[:, vlm_seq_len:]
+            vlm_query_states = apply_rotary_pos_emb(
+                vlm_q, vlm_cos, vlm_sin, unsqueeze_dim=2
+            ).transpose(1, 2)
+            vlm_key_states = apply_rotary_pos_emb(
+                vlm_k, vlm_cos, vlm_sin, unsqueeze_dim=2
+            ).transpose(1, 2)
+            vlm_value_states = vlm_v.transpose(1, 2)
+            expert_query_states = apply_rotary_pos_emb(
+                expert_q, expert_cos, expert_sin, unsqueeze_dim=2
+            ).transpose(1, 2)
+            expert_key_states = apply_rotary_pos_emb(
+                expert_k, expert_cos, expert_sin, unsqueeze_dim=2
+            ).transpose(1, 2)
+            expert_value_states = expert_v.transpose(1, 2)
+
+            # Align KV heads between the two streams only when their configs differ;
+            # the SDPA helper handles the final query-to-KV expansion.
+            vlm_kv_heads = vlm_key_states.shape[1]
+            expert_kv_heads = expert_key_states.shape[1]
+            if vlm_kv_heads != expert_kv_heads:
+                target_kv_heads = max(vlm_kv_heads, expert_kv_heads)
+                if target_kv_heads % vlm_kv_heads != 0 or target_kv_heads % expert_kv_heads != 0:
+                    raise ValueError(
+                        "Gemma4 VLM and action expert KV-head counts must divide a common target, "
+                        f"got {vlm_kv_heads} and {expert_kv_heads}"
+                    )
+                if vlm_kv_heads != target_kv_heads:
+                    vlm_key_states = repeat_kv(vlm_key_states, target_kv_heads // vlm_kv_heads)
+                    vlm_value_states = repeat_kv(vlm_value_states, target_kv_heads // vlm_kv_heads)
+                if expert_kv_heads != target_kv_heads:
+                    expert_key_states = repeat_kv(expert_key_states, target_kv_heads // expert_kv_heads)
+                    expert_value_states = repeat_kv(expert_value_states, target_kv_heads // expert_kv_heads)
+
             if frozen_vlm_path:
-                vlm_cos, vlm_sin = cos[:, :vlm_seq_len], sin[:, :vlm_seq_len]
-                expert_cos, expert_sin = cos[:, vlm_seq_len:], sin[:, vlm_seq_len:]
-
-                vlm_query_states = apply_rotary_pos_emb(
-                    vlm_q, vlm_cos, vlm_sin, unsqueeze_dim=2
-                ).transpose(1, 2)
-                vlm_key_states = apply_rotary_pos_emb(
-                    vlm_k, vlm_cos, vlm_sin, unsqueeze_dim=2
-                ).transpose(1, 2)
-                vlm_value_states = vlm_v.transpose(1, 2)
-                expert_query_states = apply_rotary_pos_emb(
-                    expert_q, expert_cos, expert_sin, unsqueeze_dim=2
-                ).transpose(1, 2)
-                expert_key_states = apply_rotary_pos_emb(
-                    expert_k, expert_cos, expert_sin, unsqueeze_dim=2
-                ).transpose(1, 2)
-                expert_value_states = expert_v.transpose(1, 2)
-
-                num_q_heads = vlm_query_states.shape[1]
-                if vlm_key_states.shape[1] != num_q_heads:
-                    vlm_kv_repeat = num_q_heads // vlm_key_states.shape[1]
-                    vlm_key_states = repeat_kv(vlm_key_states, vlm_kv_repeat)
-                    vlm_value_states = repeat_kv(vlm_value_states, vlm_kv_repeat)
-                if expert_key_states.shape[1] != num_q_heads:
-                    expert_kv_repeat = num_q_heads // expert_key_states.shape[1]
-                    expert_key_states = repeat_kv(expert_key_states, expert_kv_repeat)
-                    expert_value_states = repeat_kv(expert_value_states, expert_kv_repeat)
-
                 with torch.no_grad():
-                    vlm_att_output = torch.nn.functional.scaled_dot_product_attention(
+                    vlm_att_output = _scaled_dot_product_attention(
                         vlm_query_states,
                         vlm_key_states,
                         vlm_value_states,
                         attn_mask=None if mask is None else mask[:, :, :vlm_seq_len, :vlm_seq_len],
-                        dropout_p=0.0,
-                        scale=1.0,
                     )
-                del vlm_query_states  # VLM Q no longer needed
 
                 expert_key_states = torch.cat([vlm_key_states.detach(), expert_key_states], dim=2)
-                del vlm_key_states  # Detached copy consumed by concat
                 expert_value_states = torch.cat([vlm_value_states.detach(), expert_value_states], dim=2)
-                del vlm_value_states  # Detached copy consumed by concat
-                expert_att_output = torch.nn.functional.scaled_dot_product_attention(
+                expert_att_output = _scaled_dot_product_attention(
                     expert_query_states,
                     expert_key_states,
                     expert_value_states,
                     attn_mask=None if mask is None else mask[:, :, vlm_seq_len:, :],
-                    dropout_p=0.0,
-                    scale=1.0,
                 )
-                del expert_key_states, expert_value_states  # Consumed by SDPA
-                att_output = torch.cat([vlm_att_output, expert_att_output], dim=2)
-                del vlm_att_output, expert_att_output  # Consumed by concat
-                batch_size = expert_query_states.shape[0]
             else:
-                # Concatenate along sequence dimension, then apply RoPE
-                # (position_ids cover the full combined sequence)
-                query_states = torch.cat([vlm_q, expert_q], dim=1)  # [batch, seq, heads, head_dim]
-                key_states = torch.cat([vlm_k, expert_k], dim=1)
-                value_states = torch.cat([vlm_v, expert_v], dim=1)
+                # Concatenate only after RoPE and KV alignment. This preserves
+                # the joint-attention semantics while avoiding needless copies.
+                query_states = torch.cat([vlm_query_states, expert_query_states], dim=2)
+                key_states = torch.cat([vlm_key_states, expert_key_states], dim=2)
+                value_states = torch.cat([vlm_value_states, expert_value_states], dim=2)
+                att_output = _scaled_dot_product_attention(query_states, key_states, value_states, mask)
+                vlm_att_output, expert_att_output = att_output.split((vlm_seq_len, expert_seq_len), dim=2)
 
-                query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
-                key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
-                value_states = value_states.transpose(1, 2)
-
-                # GQA: expand KV heads to match Q heads if needed
-                # After transpose: [batch, num_heads, seq, head_dim]
-                # num_attention_heads (Q=8) may differ from num_kv_heads (K/V=4)
-                num_q_heads = query_states.shape[1]
-                num_kv_heads = key_states.shape[1]
-                if num_kv_heads != num_q_heads:
-                    n_rep = num_q_heads // num_kv_heads
-                    key_states = repeat_kv(key_states, n_rep)
-                    value_states = repeat_kv(value_states, n_rep)
-
-                batch_size = query_states.shape[0]
-
-                # On supported CUDA backends, SDPA selects a fused memory-efficient
-                # kernel for this dense prefix-LM mask and avoids materializing the
-                # [B, H, S, S] attention-weight tensor.
-                # scale=1.0 preserves the pre-existing joint-attention calculation.
-                att_output = torch.nn.functional.scaled_dot_product_attention(
-                    query_states,
-                    key_states,
-                    value_states,
-                    attn_mask=mask,
-                    dropout_p=0.0,
-                    scale=1.0,
-                )
-                del query_states, key_states, value_states  # Consumed by SDPA
-            att_output = att_output.transpose(1, 2).contiguous()
-
+            # Keep the two output streams separate; concatenating them and then
+            # splitting again creates a large transient tensor during backward.
             head_dim = vlm_layer.self_attn.head_dim
-            att_output = att_output.reshape(batch_size, -1, num_q_heads * head_dim)
-
-            # Split output back to each model
-            vlm_seq_len = vlm_hidden.shape[1]
-            vlm_att_out = att_output[:, :vlm_seq_len]
-            expert_att_out = att_output[:, vlm_seq_len:]
-            del att_output  # Free full [B, total_seq, dim] tensor immediately
+            num_q_heads = vlm_query_states.shape[1]
+            vlm_att_out = vlm_att_output.transpose(1, 2).reshape(
+                vlm_att_output.shape[0], vlm_seq_len, num_q_heads * head_dim
+            )
+            expert_att_out = expert_att_output.transpose(1, 2).reshape(
+                expert_att_output.shape[0], expert_seq_len, num_q_heads * head_dim
+            )
 
             # --- VLM: o_proj + post_attn_norm + residual + MLP (no_grad if frozen) ---
             with _vlm_ctx():
-                # Cache weight ref to avoid repeated _get_weight() lookups
-                o_proj_weight = _get_weight(vlm_layer.self_attn.o_proj)
-                if vlm_att_out.dtype != o_proj_weight.dtype:
-                    vlm_att_out = vlm_att_out.to(o_proj_weight.dtype)
+                if vlm_att_out.dtype != _get_weight(vlm_layer.self_attn.o_proj).dtype:
+                    vlm_att_out = vlm_att_out.to(_get_weight(vlm_layer.self_attn.o_proj).dtype)
                 if frozen_vlm_path:
                     vlm_att_out = vlm_att_out.detach()
                 vlm_att_out = vlm_layer.self_attn.o_proj(vlm_att_out)
                 vlm_post_attn = vlm_layer.post_attention_layernorm(vlm_att_out)
-                del vlm_att_out  # o_proj output no longer needed
                 vlm_post_attn, vlm_post_gate = (
                     vlm_post_attn if isinstance(vlm_post_attn, tuple) else (vlm_post_attn, None)
                 )
                 vlm_hidden = _gated_residual(vlm_hidden, vlm_post_attn, vlm_gate or vlm_post_gate)
-                del vlm_post_attn  # Consumed by residual connection
 
                 residual = vlm_hidden
                 vlm_ff = vlm_layer.pre_feedforward_layernorm(vlm_hidden)
-                del vlm_hidden  # Free old hidden; residual still holds reference
                 vlm_ff = vlm_layer.mlp(vlm_ff)
                 vlm_ff = vlm_layer.post_feedforward_layernorm(vlm_ff)
                 vlm_hidden = residual + vlm_ff
-                del residual, vlm_ff  # Both consumed by addition
 
                 vlm_hidden = vlm_hidden * vlm_layer.layer_scalar
 
             # --- Expert: o_proj + post_attn_norm + residual + MLP ---
-            expert_o_proj_weight = _get_weight(expert_layer.self_attn.o_proj)
-            if expert_att_out.dtype != expert_o_proj_weight.dtype:
-                expert_att_out = expert_att_out.to(expert_o_proj_weight.dtype)
+            if expert_att_out.dtype != _get_weight(expert_layer.self_attn.o_proj).dtype:
+                expert_att_out = expert_att_out.to(_get_weight(expert_layer.self_attn.o_proj).dtype)
             expert_att_out = expert_layer.self_attn.o_proj(expert_att_out)
             expert_post_attn = expert_layer.post_attention_layernorm(expert_att_out)
-            del expert_att_out  # o_proj output no longer needed
             expert_post_attn, expert_post_gate = (
                 expert_post_attn if isinstance(expert_post_attn, tuple) else (expert_post_attn, None)
             )
             expert_hidden = _gated_residual(expert_hidden, expert_post_attn, expert_gate or expert_post_gate)
-            del expert_post_attn  # Consumed by residual connection
 
             residual = expert_hidden
             expert_ff = expert_layer.pre_feedforward_layernorm(expert_hidden)
-            del expert_hidden  # Free old hidden; residual still holds reference
             expert_ff = expert_layer.mlp(expert_ff)
             expert_ff = expert_layer.post_feedforward_layernorm(expert_ff)
             expert_hidden = residual + expert_ff
-            del residual, expert_ff  # Both consumed by addition
 
             expert_hidden = expert_hidden * expert_layer.layer_scalar
 
@@ -665,88 +644,6 @@ class Gemma4WithExpertModel(nn.Module):
                 vlm_hidden, expert_hidden = compute_layer_complete(
                     layer_idx, vlm_hidden, expert_hidden, full_mask, sliding_mask, position_embeddings, adarms_cond
                 )
-
-        # If VLM has more layers than expert, continue processing VLM-only layers.
-        # This ensures the full VLM depth is utilized even when expert is smaller.
-        vlm_only_start = num_layers
-        vlm_only_end = len(vlm_model.layers)
-        if vlm_only_start < vlm_only_end:
-            vlm_seq_len = vlm_hidden.shape[1]
-
-            for layer_idx in range(vlm_only_start, vlm_only_end):
-                vlm_layer = vlm_model.layers[layer_idx]
-                layer_type = vlm_model.config.layer_types[layer_idx]
-                mask = sliding_mask if layer_type == "sliding_attention" else full_mask
-                # Slice mask to VLM-only sequence length
-                if mask is not None:
-                    mask = mask[:, :, :vlm_seq_len, :vlm_seq_len]
-                cos, sin = position_embeddings[layer_type]
-                cos, sin = cos[:, :vlm_seq_len], sin[:, :vlm_seq_len]
-
-                # Bind loop variables via default args to avoid closure capture issues
-                def _vlm_only_layer(vlm_hidden, _vlm_layer=vlm_layer, _cos=cos, _sin=sin, _mask=mask):
-                    vlm_ln_out = _vlm_layer.input_layernorm(vlm_hidden)
-                    vlm_h, vlm_gate = (vlm_ln_out if isinstance(vlm_ln_out, tuple) else (vlm_ln_out, None))
-                    input_shape_vlm = vlm_h.shape[:-1]
-                    hidden_shape_vlm = (*input_shape_vlm, -1, _vlm_layer.self_attn.head_dim)
-                    vlm_q = _vlm_layer.self_attn.q_norm(_vlm_layer.self_attn.q_proj(vlm_h).view(hidden_shape_vlm))
-                    vlm_k = _vlm_layer.self_attn.k_norm(_vlm_layer.self_attn.k_proj(vlm_h).view(hidden_shape_vlm))
-                    vlm_v = _vlm_layer.self_attn.v_norm(_vlm_layer.self_attn.v_proj(vlm_h).view(hidden_shape_vlm))
-                    del vlm_h
-
-                    # Apply RoPE
-                    vlm_q = apply_rotary_pos_emb(vlm_q, _cos, _sin, unsqueeze_dim=2).transpose(1, 2)
-                    vlm_k = apply_rotary_pos_emb(vlm_k, _cos, _sin, unsqueeze_dim=2).transpose(1, 2)
-                    vlm_v = vlm_v.transpose(1, 2)
-
-                    # GQA expand
-                    num_q_heads = vlm_q.shape[2]
-                    if vlm_k.shape[2] != num_q_heads:
-                        n_rep = num_q_heads // vlm_k.shape[2]
-                        vlm_k = repeat_kv(vlm_k, n_rep)
-                        vlm_v = repeat_kv(vlm_v, n_rep)
-
-                    att_output = torch.nn.functional.scaled_dot_product_attention(
-                        vlm_q, vlm_k, vlm_v,
-                        attn_mask=_mask, dropout_p=0.0, scale=1.0,
-                    )
-                    del vlm_q, vlm_k, vlm_v
-
-                    att_output = att_output.transpose(1, 2).contiguous()
-                    head_dim = _vlm_layer.self_attn.head_dim
-                    att_output = att_output.reshape(att_output.shape[0], -1, num_q_heads * head_dim)
-
-                    # o_proj + post_attn_norm + residual + MLP
-                    o_proj_weight = _get_weight(_vlm_layer.self_attn.o_proj)
-                    if att_output.dtype != o_proj_weight.dtype:
-                        att_output = att_output.to(o_proj_weight.dtype)
-                    att_output = _vlm_layer.self_attn.o_proj(att_output)
-                    vlm_post_attn = _vlm_layer.post_attention_layernorm(att_output)
-                    del att_output
-                    vlm_post_attn, vlm_post_gate = (
-                        vlm_post_attn if isinstance(vlm_post_attn, tuple) else (vlm_post_attn, None)
-                    )
-                    vlm_hidden = _gated_residual(vlm_hidden, vlm_post_attn, vlm_gate or vlm_post_gate)
-                    del vlm_post_attn
-
-                    residual = vlm_hidden
-                    vlm_ff = _vlm_layer.pre_feedforward_layernorm(vlm_hidden)
-                    del vlm_hidden
-                    vlm_ff = _vlm_layer.mlp(vlm_ff)
-                    vlm_ff = _vlm_layer.post_feedforward_layernorm(vlm_ff)
-                    vlm_hidden = residual + vlm_ff
-                    del residual, vlm_ff
-
-                    vlm_hidden = vlm_hidden * _vlm_layer.layer_scalar
-                    return vlm_hidden
-
-                if use_gradient_checkpointing:
-                    vlm_hidden = torch.utils.checkpoint.checkpoint(
-                        _vlm_only_layer, vlm_hidden,
-                        use_reentrant=False, preserve_rng_state=False,
-                    )
-                else:
-                    vlm_hidden = _vlm_only_layer(vlm_hidden)
 
         # Final norm
         prefix_output = vlm_model.norm(vlm_hidden)

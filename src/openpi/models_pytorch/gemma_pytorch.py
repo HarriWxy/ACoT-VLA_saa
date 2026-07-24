@@ -1,4 +1,5 @@
-from typing import Literal
+import logging
+from typing import Literal, Optional
 
 import torch
 from torch import nn
@@ -6,6 +7,142 @@ from transformers import GemmaForCausalLM
 from transformers import PaliGemmaForConditionalGeneration
 from transformers.models.auto import CONFIG_MAPPING
 from transformers.models.gemma import modeling_gemma
+
+
+# ---------------------------------------------------------------------------
+# Compatibility shim: transformers ≥5.x removed the top-level `.language_model`
+# and `.vision_tower` properties from `PaliGemmaForConditionalGeneration`.
+# The code throughout this module (and `pi0_pytorch.py`) still uses the old
+# paths, so we re-inject lightweight @property accessors that delegate to
+# `self.model.<attr>`.
+# ---------------------------------------------------------------------------
+def _patch_paligemma_properties() -> None:
+    """Add `.language_model` / `.vision_tower` / `.multi_modal_projector` properties
+    to `PaliGemmaForConditionalGeneration` if they are missing."""
+    if getattr(PaliGemmaForConditionalGeneration, "_openpi_props_patched", False):
+        return
+
+    if not hasattr(PaliGemmaForConditionalGeneration, "language_model"):
+        PaliGemmaForConditionalGeneration.language_model = property(
+            lambda self: self.model.language_model
+        )
+    if not hasattr(PaliGemmaForConditionalGeneration, "vision_tower"):
+        PaliGemmaForConditionalGeneration.vision_tower = property(
+            lambda self: self.model.vision_tower
+        )
+    if not hasattr(PaliGemmaForConditionalGeneration, "multi_modal_projector"):
+        PaliGemmaForConditionalGeneration.multi_modal_projector = property(
+            lambda self: self.model.multi_modal_projector
+        )
+
+    PaliGemmaForConditionalGeneration._openpi_props_patched = True  # noqa: SLF001
+
+
+_patch_paligemma_properties()
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# Compatibility shim: monkey-patch GemmaRMSNorm to support adaRMS
+# (adaptive RMSNorm with `cond` parameter).
+#
+# The `transformers_replace` patches for Gemma2 add a `cond_dim` parameter to
+# GemmaRMSNorm and a `cond` kwarg to its forward() method.  Transformers ≥5.x
+# does not have these, so we patch the class in-place.
+#
+# Two things need to happen:
+#   1. extend __init__ to accept `cond_dim` (needed during model construction)
+#   2. extend forward() to accept an optional `cond` kwarg and return a
+#      (hidden_states, gate) tuple (needed at runtime by gemma_pytorch.py)
+# ---------------------------------------------------------------------------
+_GemmaRMSNorm = modeling_gemma.GemmaRMSNorm
+_ORIG_RMSNORM_INIT = _GemmaRMSNorm.__init__
+_ORIG_RMSNORM_FORWARD = _GemmaRMSNorm.__forward__ if hasattr(_GemmaRMSNorm, "__forward__") else _GemmaRMSNorm.forward
+
+
+def _patched_rmsnorm_init(self, dim: int, eps: float = 1e-6, cond_dim: Optional[int] = None):
+    """Extended __init__ that optionally creates an adaptive dense layer."""
+    _ORIG_RMSNORM_INIT(self, dim, eps)
+    self.cond_dim = cond_dim
+    if cond_dim is not None:
+        self.dense = nn.Linear(cond_dim, dim * 3, bias=True)
+        nn.init.zeros_(self.dense.weight)
+        nn.init.zeros_(self.dense.bias)
+    else:
+        self.dense = None
+
+
+def _patched_rmsnorm_forward(self, x, cond=None):
+    """Extended forward that supports an optional `cond` (adaRMS conditioning).
+
+    Returns (hidden_states, gate) where gate is None when cond is None.
+    """
+    dtype = x.dtype
+    # RMSNorm computation (in float32 for numerical stability)
+    var = torch.mean(torch.square(x.float()), dim=-1, keepdim=True)
+    normed = x * torch.rsqrt(var + self.eps)
+
+    if cond is None or self.dense is None:
+        # Standard RMSNorm path
+        out = normed * (1.0 + self.weight.float())
+        return out.to(dtype), None
+
+    # adaRMS path: generate scale / shift / gate from the conditioning vector
+    modulation = self.dense(cond.to(next(self.parameters()).dtype))
+    if x.ndim == 3:
+        modulation = modulation.unsqueeze(1)
+    scale, shift, gate = torch.chunk(modulation, 3, dim=-1)
+    out = normed * (1.0 + scale.float()) + shift.float()
+    return out.to(dtype), gate.to(dtype)
+
+
+# Only patch if the native GemmaRMSNorm doesn't already support cond
+if not hasattr(_GemmaRMSNorm, "dense"):
+    _GemmaRMSNorm.__init__ = _patched_rmsnorm_init
+    _GemmaRMSNorm.forward = _patched_rmsnorm_forward
+    # Also patch the decoder-layer class so layers are created with cond_dim
+    _GemmaDecoderLayer = modeling_gemma.GemmaDecoderLayer
+    _ORIG_DECODER_INIT = _GemmaDecoderLayer.__init__
+
+    def _patched_decoder_init(self, config, layer_idx):
+        _ORIG_DECODER_INIT(self, config, layer_idx)
+        # Re-create layernorms with cond_dim if use_adarms is enabled
+        cond_dim = getattr(config, "adarms_cond_dim", None) if getattr(config, "use_adarms", False) else None
+        if cond_dim is not None:
+            self.input_layernorm = _GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim)
+            self.post_attention_layernorm = _GemmaRMSNorm(
+                config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
+            )
+
+    _GemmaDecoderLayer.__init__ = _patched_decoder_init
+
+    # Patch GemmaModel.__init__ for the final norm layer
+    _GemmaModel = modeling_gemma.GemmaModel
+    _ORIG_GEMMA_MODEL_INIT = _GemmaModel.__init__
+
+    def _patched_gemma_model_init(self, config):
+        _ORIG_GEMMA_MODEL_INIT(self, config)
+        cond_dim = getattr(config, "adarms_cond_dim", None) if getattr(config, "use_adarms", False) else None
+        if cond_dim is not None and hasattr(self, "norm"):
+            self.norm = _GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim)
+
+    _GemmaModel.__init__ = _patched_gemma_model_init
+
+    logging.getLogger(__name__).info("Patched GemmaRMSNorm with adaRMS (cond) support")
+
+# Inject _gated_residual into modeling_gemma if missing (needed by
+# gemma_pytorch.py and acot_vla_pytorch.py which call
+# modeling_gemma._gated_residual(...)).
+if not hasattr(modeling_gemma, "_gated_residual"):
+
+    def _gated_residual(x, y, gate):
+        """Gated residual: x + y * gate if gate is provided, else x + y."""
+        if gate is None:
+            return x + y
+        return x + y * gate
+
+    modeling_gemma._gated_residual = _gated_residual  # noqa: SLF001
+# ---------------------------------------------------------------------------
 
 
 class PaliGemmaWithExpertModel(nn.Module):
@@ -82,7 +219,16 @@ class PaliGemmaWithExpertModel(nn.Module):
                 param.data = param.data.to(dtype=torch.float32)
 
     def embed_image(self, image: torch.Tensor):
-        return self.paligemma.model.get_image_features(image)
+        result = self.paligemma.model.get_image_features(image)
+        # transformers ≥5.x returns BaseModelOutputWithPooling; the projected
+        # image features live in .pooler_output (same as the library's own code).
+        if hasattr(result, "pooler_output") and result.pooler_output is not None:
+            return result.pooler_output
+        if isinstance(result, torch.Tensor):
+            return result
+        if hasattr(result, "last_hidden_state"):
+            return result.last_hidden_state
+        return result
 
     def embed_language_tokens(self, tokens: torch.Tensor):
         return self.paligemma.language_model.embed_tokens(tokens)

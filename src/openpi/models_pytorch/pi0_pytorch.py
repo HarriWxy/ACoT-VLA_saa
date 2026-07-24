@@ -164,15 +164,15 @@ class PI0Pytorch(nn.Module):
 
         # transformers_replace check is only needed for Gemma 2 based models
         # (Gemma 4 is natively supported in transformers 5.x)
-        if not self._is_gemma4:
-            msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
-            try:
-                from transformers.models.siglip import check
+        # if not self._is_gemma4:
+        #     msg = "transformers_replace is not installed correctly. Please install it with `uv pip install transformers==4.53.2` and `cp -r ./src/openpi/models_pytorch/transformers_replace/* .venv/lib/python3.11/site-packages/transformers/`."
+        #     try:
+        #         from transformers.models.siglip import check
 
-                if not check.check_whether_transformers_replace_is_installed_correctly():
-                    raise ValueError(msg)
-            except ImportError:
-                raise ValueError(msg) from None
+        #         if not check.check_whether_transformers_replace_is_installed_correctly():
+        #             raise ValueError(msg)
+        #     except ImportError:
+        #         raise ValueError(msg) from None
 
         # --- LoRA injection for Gemma 4 ---
         self._lora_injected = False
@@ -191,9 +191,7 @@ class PI0Pytorch(nn.Module):
         )
         self._lora_injected = True
         trainable, total = self.count_trainable_params()
-        logging.info(
-            f"LoRA injected: {trainable / 1e6:.2f}M / {total / 1e6:.2f}M trainable ({100 * trainable / total:.2f}%)"
-        )
+        logging.info(f"LoRA injected: {trainable / 1e6:.2f}M / {total / 1e6:.2f}M trainable ({100 * trainable / total:.2f}%)")
 
     def freeze_non_lora_params(self):
         """Freeze all parameters except LoRA adapters and action heads.
@@ -261,20 +259,16 @@ class PI0Pytorch(nn.Module):
             self.action_out_proj.parameters(),
         ]
         if self.pi05:
-            action_head_params.extend(
-                [
-                    self.time_mlp_in.parameters(),
-                    self.time_mlp_out.parameters(),
-                ]
-            )
+            action_head_params.extend([
+                self.time_mlp_in.parameters(),
+                self.time_mlp_out.parameters(),
+            ])
         else:
-            action_head_params.extend(
-                [
-                    self.state_proj.parameters(),
-                    self.action_time_mlp_in.parameters(),
-                    self.action_time_mlp_out.parameters(),
-                ]
-            )
+            action_head_params.extend([
+                self.state_proj.parameters(),
+                self.action_time_mlp_in.parameters(),
+                self.action_time_mlp_out.parameters(),
+            ])
 
         for param_group in action_head_params:
             for p in param_group:
@@ -297,7 +291,6 @@ class PI0Pytorch(nn.Module):
         """Enable gradient checkpointing for memory optimization."""
         self.gradient_checkpointing_enabled = True
         if self._is_gemma4:
-            self.paligemma_with_expert.gemma4_vlm.model.gradient_checkpointing = True
             self.paligemma_with_expert.gemma4_vlm.model.gradient_checkpointing = True
             self.paligemma_with_expert.gemma4_expert.model.gradient_checkpointing = True
         else:
@@ -497,9 +490,7 @@ class PI0Pytorch(nn.Module):
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
-            return self.action_in_proj(
-                noisy_actions
-            )  # [B, action_horizon, action_dim] -> [B, action_horizon, width] action dim!=32
+            return self.action_in_proj(noisy_actions)  # [B, action_horizon, action_dim] -> [B, action_horizon, width] action dim!=32
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
@@ -575,7 +566,7 @@ class PI0Pytorch(nn.Module):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1  # position_ids shape: [batch_size, seq_len]
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1 # position_ids shape: [batch_size, seq_len] 
 
         # Prepare attention masks (Gemma 4 needs dual masks: full + sliding window)
         if self._is_gemma4:
@@ -602,13 +593,21 @@ class PI0Pytorch(nn.Module):
         # checkpointing inside. Wrapping it in another _apply_checkpoint causes
         # double-checkpointing: the outer checkpoint re-executes ALL layers during
         # backward, forcing inner checkpoints to re-save tensors and doubling memory.
-        suffix_out = forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond)
+        
+        suffix_out = self._apply_checkpoint(
+            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        )
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        # Single linear layer — checkpoint overhead outweighs any memory saving
-        v_t = self.action_out_proj(suffix_out)
+        # Apply gradient checkpointing to final action projection if enabled
+        def action_out_proj_func(suffix_out):
+            return self.action_out_proj(suffix_out)
+
+        # 这里可以对比实验一下
+        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+
 
         return F.mse_loss(u_t, v_t, reduction="none")
 

@@ -269,13 +269,13 @@ class OfflineGRPOConfig:
     weight_decay: float = 1e-4
 
     # ── Offline data settings ──
-    data_dir: str = "dataset/srb_tracking"
+    data_dir: str = "dataset/srb_tracking" 
     reward_aggregation: Literal["sum", "mean", "last", "binary_sum"] = "sum"
     reward_threshold: float = 0.0
     frames_per_episode: int = 2  # Frames sampled per episode per training step
 
     # ── Model / checkpoint ──
-    config_name: str = "srb_train_gemma4"
+    config_name: str = "srb_train_tracking" # srb_train_gemma4
     checkpoint_dir: str | None = None
     action_horizon: int = 16
     action_dim: int = 37
