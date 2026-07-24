@@ -487,7 +487,6 @@ class Gemma4WithExpertModel(nn.Module):
                 vlm_q = vlm_layer.self_attn.q_norm(vlm_layer.self_attn.q_proj(vlm_h).view(hidden_shape_vlm))
                 vlm_k = vlm_layer.self_attn.k_norm(vlm_layer.self_attn.k_proj(vlm_h).view(hidden_shape_vlm))
                 vlm_v = vlm_layer.self_attn.v_norm(vlm_layer.self_attn.v_proj(vlm_h).view(hidden_shape_vlm))
-                # del vlm_h  # input_layernorm output consumed by Q/K/V projections
 
             # Expert branch: always with grad
             expert_ln_out = expert_layer.input_layernorm(expert_hidden)
