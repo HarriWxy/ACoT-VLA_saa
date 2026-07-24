@@ -594,9 +594,10 @@ class PI0Pytorch(nn.Module):
         # double-checkpointing: the outer checkpoint re-executes ALL layers during
         # backward, forcing inner checkpoints to re-save tensors and doubling memory.
         
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+        # suffix_out = self._apply_checkpoint(
+        #     forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
+        # )
+        suffix_out = forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond)
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
@@ -606,7 +607,9 @@ class PI0Pytorch(nn.Module):
             return self.action_out_proj(suffix_out)
 
         # 这里可以对比实验一下
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        # v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        v_t = self.action_out_proj(suffix_out)
+
 
 
         return F.mse_loss(u_t, v_t, reduction="none")

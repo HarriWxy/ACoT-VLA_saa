@@ -99,14 +99,14 @@ def main():
         "--config_name",
         type=str,
         # required=True,
-        default="pi05_libero_gemma4",
+        default="srb_train_gemma4",
         help="Training config name (e.g., pi0_aloha_sim_gemma4). Must exist in _CONFIGS.",
     )
     parser.add_argument(
         "--output_path",
         type=str,
         # required=True,
-        default="checkpoints/gemma4",
+        default="checkpoints/gemma4_lora",
         help="Output path for the PyTorch checkpoint.",
     )
     parser.add_argument(
