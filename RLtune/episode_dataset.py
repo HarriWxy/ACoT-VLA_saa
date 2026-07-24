@@ -199,6 +199,8 @@ class EpisodeAwareDataset:
         Uses **transformed** dataset for model inputs (state, image, actions)
         and **raw** dataset for rewards (reward is dropped by RepackTransform).
 
+        Batch size = len(episode_indices) * frames_per_episode.
+
         Returns:
             obs_batch: dict — batched model-ready tensors
             action_batch: np.ndarray (B, action_horizon, action_dim)

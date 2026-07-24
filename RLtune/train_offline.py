@@ -75,6 +75,8 @@ from RLtune.train_pytorch import setup_ddp
 
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
 
+os.environ["world_size"] = "1" # use 2 gpus for training
+
 # FSDP imports (available in PyTorch 2.0+)
 try:
     from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -244,7 +246,7 @@ class OfflineGRPOConfig:
     """
 
     # ── Core RL hyperparameters ──
-    n_samples: int = 8
+    n_samples: int = 4 # batch size for advantage estimation
     clip_ratio_high: float = 0.28
     clip_ratio_low: float = 0.2
     gamma: float = 1.0
@@ -256,7 +258,7 @@ class OfflineGRPOConfig:
     adv_estimator: Literal["grpo", "rloo", "reinforce_plus_plus"] = "grpo"
 
     # ── Accuracy filtering ──
-    filter_by_accuracy: bool = True
+    filter_by_accuracy: bool = False  # True
     accuracy_lower_bound: float = 0.1
     accuracy_upper_bound: float = 0.9
 
@@ -275,10 +277,10 @@ class OfflineGRPOConfig:
     frames_per_episode: int = 2  # Frames sampled per episode per training step
 
     # ── Model / checkpoint ──
-    config_name: str = "srb_train_tracking" # srb_train_gemma4
+    config_name: str = "srb_train_gemma4" #  srb_train_tracking
     checkpoint_dir: str | None = None
-    action_horizon: int = 16
-    action_dim: int = 37
+    action_horizon: int = 1
+    action_dim: int = 19
 
     # ── Projection Head ──
     projection_head: ProjectionHeadConfig = dataclasses.field(default_factory=ProjectionHeadConfig)
@@ -321,6 +323,14 @@ def train_loop(rl_config: OfflineGRPOConfig):
             base_config,
             checkpoint_dir_override=pathlib.Path(rl_config.checkpoint_dir),
         )
+
+    # Override action_horizon from RL config (the base config may define a
+    # different action_horizon; our RL setting should take precedence).
+    if base_config.model.action_horizon != rl_config.action_horizon:
+        logging.info(
+            f"Overriding action_horizon: {base_config.model.action_horizon} -> {rl_config.action_horizon}"
+        )
+        object.__setattr__(base_config.model, "action_horizon", rl_config.action_horizon)
 
     rl_ckpt_dir = base_config.checkpoint_dir / "rl_grpo"
     resuming = rl_ckpt_dir.exists() and any(rl_ckpt_dir.glob("epoch_*"))
@@ -489,16 +499,16 @@ def train_loop(rl_config: OfflineGRPOConfig):
             logging.info(f"{'=' * 60}")
 
         # ── Phase 1: Sample episode group for GRPO ──
-        groups = dataset.sample_episodes_for_grpo(
+        group = dataset.sample_episodes_for_grpo(
             n_groups=1,
             n_samples_per_group=rl_config.n_samples,
             rng=rng,
-        )
-        group = groups[0]
+        )[0]
+        # group = groups
 
         # ── Phase 2: Compute episode rewards ──
-        rewards = np.array([dataset.get_episode_reward(ep) for ep in group], dtype=np.float32)
-        prompt_indices = np.zeros(len(group), dtype=np.int64)  # All same task
+        rewards = np.array([dataset.get_episode_reward(ep) for ep in group], dtype=np.float16)
+        prompt_indices = np.zeros(len(group), dtype=np.int16)  # All same task
 
         if is_main:
             logging.info(
