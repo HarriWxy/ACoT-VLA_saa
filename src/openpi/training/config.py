@@ -650,7 +650,7 @@ class TrainConfig:
     # will increase memory and CPU usage.
     num_workers: int = 2
     # Number of train steps (batches) to run.
-    num_train_steps: int = 30_000
+    num_train_steps: int = 30000
 
     # How often (in steps) to log training metrics.
     log_interval: int = 100
@@ -1166,6 +1166,51 @@ _CONFIGS = [
             pi05=True, action_horizon=16, discrete_state_input=False,
             paligemma_variant="gemma4_e2b_lora",
             action_expert_variant="gemma4_300m_aligned_lora",
+            gemma4_model_path="./models/gemma-4-E2B",
+        ).get_freeze_filter(),
+        ema_decay=None,
+    ),
+    # Low-memory SRB config: gemma4_e2b VLM + gemma4_300m_tiny expert (depth=6 vs 18).
+    # Saves ~207M expert params and ~12 layers of activation memory.
+    # Note: num_layers=min(35, 6)=6, so only 6 VLM layers are processed via joint attention.
+    TrainConfig(
+        name="srb_train_gemma4_low_mem",
+        model=pi0_config.Pi0Config(
+            pi05=True, action_horizon=16, discrete_state_input=False,
+            paligemma_variant="gemma4_e2b_lora",
+            action_expert_variant="gemma4_300m_tiny_lora",
+            gemma4_model_path="./models/gemma-4-E2B",
+        ),
+        data=SRBDataConfig(
+            repo_id="srb_tracking",
+            base_config=DataConfig(prompt_from_task=True, action_sequence_keys=("action",)),
+            action_dim=19,
+            observation_keys=("state","proprio"),
+            image_keys=("image_base",),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "image_base": "observation.images.image_front",
+                            "action": "action",
+                            "reward": "reward",
+                            "prompt": "prompt",
+                        }
+                    )
+                ]
+            ),
+        ),
+        num_train_steps=20,
+        batch_size=4,
+        exp_name="srb_sample_low_mem",
+        save_interval=100,
+        overwrite=True,
+        wandb_enabled=False,
+        freeze_filter=pi0_config.Pi0Config(
+            pi05=True, action_horizon=16, discrete_state_input=False,
+            paligemma_variant="gemma4_e2b_lora",
+            action_expert_variant="gemma4_300m_tiny_lora",
             gemma4_model_path="./models/gemma-4-E2B",
         ).get_freeze_filter(),
         ema_decay=None,

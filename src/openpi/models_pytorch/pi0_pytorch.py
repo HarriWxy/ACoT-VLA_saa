@@ -11,7 +11,7 @@ from openpi.models_pytorch.gemma_pytorch import PaliGemmaWithExpertModel
 import openpi.models_pytorch.preprocessing_pytorch as _preprocessing
 
 # Gemma 4 support
-_GEMMA4_VARIANTS = {"gemma4_300m", "gemma4_300m_lora", "gemma4_2b", "gemma4_2b_lora", "gemma4_e2b", "gemma4_e2b_lora"}
+_GEMMA4_VARIANTS = {"gemma4_300m", "gemma4_300m_lora", "gemma4_2b", "gemma4_2b_lora", "gemma4_e2b", "gemma4_e2b_lora", "gemma4_300m_tiny", "gemma4_300m_tiny_lora"}
 
 
 def _is_gemma4_variant(variant: str) -> bool:
@@ -139,6 +139,7 @@ class PI0Pytorch(nn.Module):
         # 支持 OPENPI_DISABLE_COMPILE=1 环境变量禁用 torch.compile
         # (调试器 / torch.compile 不兼容时使用)
         import os
+
         _compile_mode = config.pytorch_compile_mode
         if os.environ.get("OPENPI_DISABLE_COMPILE", "0") == "1":
             _compile_mode = None
@@ -190,7 +191,9 @@ class PI0Pytorch(nn.Module):
         )
         self._lora_injected = True
         trainable, total = self.count_trainable_params()
-        logging.info(f"LoRA injected: {trainable / 1e6:.2f}M / {total / 1e6:.2f}M trainable ({100 * trainable / total:.2f}%)")
+        logging.info(
+            f"LoRA injected: {trainable / 1e6:.2f}M / {total / 1e6:.2f}M trainable ({100 * trainable / total:.2f}%)"
+        )
 
     def freeze_non_lora_params(self):
         """Freeze all parameters except LoRA adapters and action heads.
@@ -258,16 +261,20 @@ class PI0Pytorch(nn.Module):
             self.action_out_proj.parameters(),
         ]
         if self.pi05:
-            action_head_params.extend([
-                self.time_mlp_in.parameters(),
-                self.time_mlp_out.parameters(),
-            ])
+            action_head_params.extend(
+                [
+                    self.time_mlp_in.parameters(),
+                    self.time_mlp_out.parameters(),
+                ]
+            )
         else:
-            action_head_params.extend([
-                self.state_proj.parameters(),
-                self.action_time_mlp_in.parameters(),
-                self.action_time_mlp_out.parameters(),
-            ])
+            action_head_params.extend(
+                [
+                    self.state_proj.parameters(),
+                    self.action_time_mlp_in.parameters(),
+                    self.action_time_mlp_out.parameters(),
+                ]
+            )
 
         for param_group in action_head_params:
             for p in param_group:
@@ -393,17 +400,28 @@ class PI0Pytorch(nn.Module):
         """Embed images with SigLIP and language tokens with embedding layer to prepare
         for PaliGemma transformer processing.
         """
+        # Detect frozen VLM state (cached — safe because freeze_vlm_only() is called before training)
+        if not hasattr(self, "_vlm_frozen"):
+            self._vlm_frozen = not any(p.requires_grad for p in self.paligemma_with_expert.parameters())
+
+        use_no_grad = self._vlm_frozen and self.training
+
         embs = []
         pad_masks = []
         att_masks = []
 
         # Process images
         for img, img_mask in zip(images, img_masks, strict=True):
+            if use_no_grad:
+                # Frozen VLM: skip checkpoint overhead, use no_grad directly
+                with torch.no_grad():
+                    img_emb = self.paligemma_with_expert.embed_image(img)
+            else:
 
-            def image_embed_func(img):
-                return self.paligemma_with_expert.embed_image(img)
+                def image_embed_func(img):
+                    return self.paligemma_with_expert.embed_image(img)
 
-            img_emb = self._apply_checkpoint(image_embed_func, img)
+                img_emb = self._apply_checkpoint(image_embed_func, img)
 
             bsize, num_img_embs = img_emb.shape[:2]
 
@@ -414,12 +432,19 @@ class PI0Pytorch(nn.Module):
             att_masks += [0] * num_img_embs
 
         # Process language tokens
-        def lang_embed_func(lang_tokens):
-            lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
-            lang_emb_dim = lang_emb.shape[-1]
-            return lang_emb * math.sqrt(lang_emb_dim)
+        if use_no_grad:
+            with torch.no_grad():
+                lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+                lang_emb_dim = lang_emb.shape[-1]
+                lang_emb = lang_emb * math.sqrt(lang_emb_dim)
+        else:
 
-        lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
+            def lang_embed_func(lang_tokens):
+                lang_emb = self.paligemma_with_expert.embed_language_tokens(lang_tokens)
+                lang_emb_dim = lang_emb.shape[-1]
+                return lang_emb * math.sqrt(lang_emb_dim)
+
+            lang_emb = self._apply_checkpoint(lang_embed_func, lang_tokens)
 
         embs.append(lang_emb)
         pad_masks.append(lang_masks)
@@ -472,7 +497,9 @@ class PI0Pytorch(nn.Module):
 
         # Fuse timestep + action information using an MLP
         def action_proj_func(noisy_actions):
-            return self.action_in_proj(noisy_actions)  # [B, action_horizon, action_dim] -> [B, action_horizon, width] action dim!=32
+            return self.action_in_proj(
+                noisy_actions
+            )  # [B, action_horizon, action_dim] -> [B, action_horizon, width] action dim!=32
 
         action_emb = self._apply_checkpoint(action_proj_func, noisy_actions)
 
@@ -548,7 +575,7 @@ class PI0Pytorch(nn.Module):
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
-        position_ids = torch.cumsum(pad_masks, dim=1) - 1 # position_ids shape: [batch_size, seq_len] 
+        position_ids = torch.cumsum(pad_masks, dim=1) - 1  # position_ids shape: [batch_size, seq_len]
 
         # Prepare attention masks (Gemma 4 needs dual masks: full + sliding window)
         if self._is_gemma4:
@@ -571,18 +598,17 @@ class PI0Pytorch(nn.Module):
             )
             return suffix_out
 
-        suffix_out = self._apply_checkpoint(
-            forward_func, prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond
-        )
+        # Call forward_func directly — _forward_joint already has per-layer gradient
+        # checkpointing inside. Wrapping it in another _apply_checkpoint causes
+        # double-checkpointing: the outer checkpoint re-executes ALL layers during
+        # backward, forcing inner checkpoints to re-save tensors and doubling memory.
+        suffix_out = forward_func(prefix_embs, suffix_embs, att_2d_masks_4d, position_ids, adarms_cond)
 
         suffix_out = suffix_out[:, -self.config.action_horizon :]
         suffix_out = suffix_out.to(dtype=torch.float32)
 
-        # Apply gradient checkpointing to final action projection if enabled
-        def action_out_proj_func(suffix_out):
-            return self.action_out_proj(suffix_out)
-
-        v_t = self._apply_checkpoint(action_out_proj_func, suffix_out)
+        # Single linear layer — checkpoint overhead outweighs any memory saving
+        v_t = self.action_out_proj(suffix_out)
 
         return F.mse_loss(u_t, v_t, reduction="none")
 

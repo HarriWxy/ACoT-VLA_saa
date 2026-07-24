@@ -422,7 +422,7 @@ class YourEnvRewardManager:
 ## 加载数据集
 
 ```bash
-mkdir -p /home/omnisky/.cache/huggingface/lerobot && ln -s /media/omnisky/sda/algos/R2A/Algos/ACoT-VLA_saa/dataset/srb_dataset /home/omnisky/.cache/huggingface/lerobot/srb_dataset && echo "符号链接创建成功" && ls -la /home/omnisky/.cache/huggingface/lerobot/srb_dataset
+mkdir -p ~/.cache/huggingface/lerobot && ln -s /media/omnisky/sda/algos/R2A/Algos/ACoT-VLA_saa/dataset/srb_dataset ~/.cache/huggingface/lerobot/srb_dataset && echo "符号链接创建成功" && ls -la ~/.cache/huggingface/lerobot/srb_dataset
 ```
 
 ---

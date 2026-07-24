@@ -67,6 +67,8 @@ Variant = Literal[
     "gemma4_e2b_lora",
     "gemma4_300m_aligned",
     "gemma4_300m_aligned_lora",
+    "gemma4_300m_tiny",
+    "gemma4_300m_tiny_lora",
 ]
 
 
@@ -217,6 +219,31 @@ def get_config(variant: Variant) -> Config:
             head_dim=256,
             global_head_dim=256,
             lora_configs={"attn": lora.LoRAConfig(rank=16, alpha=16.0), "ffn": lora.LoRAConfig(rank=16, alpha=16.0)},
+        )
+    if variant == "gemma4_300m_tiny":
+        # Lightweight action expert: depth=6 (vs 18), same width as gemma4_300m.
+        # ~104M params, saves ~207M params and ~12 layers of activation memory.
+        # Use when VRAM is tight and the VLM already provides strong features.
+        return Config(
+            width=1024,
+            depth=6,
+            mlp_dim=4096,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            global_head_dim=256,
+        )
+    if variant == "gemma4_300m_tiny_lora":
+        # Lightweight action expert with LoRA
+        return Config(
+            width=1024,
+            depth=6,
+            mlp_dim=4096,
+            num_heads=8,
+            num_kv_heads=1,
+            head_dim=256,
+            global_head_dim=256,
+            lora_configs={"attn": lora.LoRAConfig(rank=32, alpha=32.0), "ffn": lora.LoRAConfig(rank=32, alpha=32.0)},
         )
     raise ValueError(f"Unknown variant: {variant}")
 
