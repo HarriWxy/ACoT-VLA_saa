@@ -13,8 +13,11 @@ Environment:
     OPENPI_DISABLE_COMPILE=1  — disable torch.compile for cleaner debugging
 """
 
+import argparse
+import json
 import os
 import sys
+from pathlib import Path
 
 # Set environment before importing torch
 os.environ.setdefault("OPENPI_DISABLE_COMPILE", "1")
@@ -29,6 +32,32 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 from openpi.training import config as _config
 from openpi.policies import policy_config
+
+
+# ============================================================================
+# CLI helpers
+# ============================================================================
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Compare JAX and PyTorch checkpoints for weight and runtime consistency")
+    parser.add_argument("--samples", type=int, default=5, help="Number of SRB samples to evaluate")
+    parser.add_argument("--num-steps", type=int, default=10, help="Number of denoising steps for policy inference")
+    parser.add_argument("--output-json", type=str, default=None, help="Optional path to save a JSON summary")
+    parser.add_argument("--skip-weight", action="store_true", help="Skip weight-level comparison")
+    parser.add_argument("--skip-runtime", action="store_true", help="Skip runtime-level comparison")
+    parser.add_argument("--skip-component", action="store_true", help="Skip component-level comparison")
+    return parser.parse_args()
+
+
+def save_results(path: str | None, payload: dict) -> None:
+    if path is None:
+        return
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+    print(f"\nSaved JSON summary to {out_path}")
 
 
 # ============================================================================
@@ -303,6 +332,8 @@ def compare_component_outputs(
 
 
 def main():
+    args = parse_args()
+
     print("=" * 80)
     print("JAX vs PyTorch Model Comparison")
     print("=" * 80)
@@ -312,6 +343,17 @@ def main():
     converted_checkpoint = "checkpoints/pi05_srb_pytorch/model.safetensors"
     srb_train_checkpoint = "checkpoints/srb_train/model.safetensors"
 
+    results: dict = {
+        "jax_checkpoint": jax_checkpoint,
+        "converted_checkpoint": converted_checkpoint,
+        "srb_train_checkpoint": srb_train_checkpoint,
+        "samples": args.samples,
+        "num_steps": args.num_steps,
+        "weight": None,
+        "runtime": {},
+        "component": {},
+    }
+
     # ---------------------------------------------------------------
     # Part 1: Weight-level comparison
     # ---------------------------------------------------------------
@@ -319,22 +361,25 @@ def main():
     print("# PART 1: Weight-level comparison")
     print("#" * 80)
 
-    if os.path.exists(converted_checkpoint) and os.path.exists(srb_train_checkpoint):
-        w_converted = load_safetensors_weights(converted_checkpoint)
-        w_srb_train = load_safetensors_weights(srb_train_checkpoint)
+    if not args.skip_weight:
+        if os.path.exists(converted_checkpoint) and os.path.exists(srb_train_checkpoint):
+            w_converted = load_safetensors_weights(converted_checkpoint)
+            w_srb_train = load_safetensors_weights(srb_train_checkpoint)
 
-        compare_weight_dicts(
+            results["weight"] = compare_weight_dicts(
             "Converted (pi05_srb_pytorch)",
             w_converted,
             "Trained (srb_train)",
             w_srb_train,
-        )
+            )
+        else:
+            print("Skipping weight comparison: checkpoints not found")
+            if not os.path.exists(converted_checkpoint):
+                print(f"  Missing: {converted_checkpoint}")
+            if not os.path.exists(srb_train_checkpoint):
+                print(f"  Missing: {srb_train_checkpoint}")
     else:
-        print("Skipping weight comparison: checkpoints not found")
-        if not os.path.exists(converted_checkpoint):
-            print(f"  Missing: {converted_checkpoint}")
-        if not os.path.exists(srb_train_checkpoint):
-            print(f"  Missing: {srb_train_checkpoint}")
+        print("Skipping weight comparison as requested")
 
     # ---------------------------------------------------------------
     # Part 2: Runtime-level comparison
@@ -343,71 +388,77 @@ def main():
     print("# PART 2: Runtime-level comparison")
     print("#" * 80)
 
-    # Load dataset
-    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+    if args.skip_runtime:
+        print("Skipping runtime comparison as requested")
+    else:
+        # Load dataset
+        from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
-    ds = LeRobotDataset("srb_dataset")
-    samples = [ds[i] for i in range(min(5, len(ds)))]
+        ds = LeRobotDataset("srb_dataset")
+        samples = [ds[i] for i in range(min(args.samples, len(ds)))]
 
-    # Create policies
-    jax_cfg = _config.get_config("pi05_srb")
-    jax_policy = policy_config.create_trained_policy(
-        jax_cfg,
-        jax_checkpoint,
-        sample_kwargs={"num_steps": 10},
-        pytorch_device="cpu",
-    )
-
-    # Converted PyTorch policy (same JAX weights, PyTorch implementation)
-    converted_dir = os.path.dirname(converted_checkpoint) if "model.safetensors" in converted_checkpoint else converted_checkpoint
-    converted_cfg = _config.get_config("pi05_srb")
-    converted_policy = policy_config.create_trained_policy(
-        converted_cfg,
-        converted_dir,
-        sample_kwargs={"num_steps": 10},
-        pytorch_device="cpu",
-    )
-
-    # Compare JAX vs converted PyTorch (same weights, different implementation)
-    compare_runtime_outputs(
-        "JAX base",
-        jax_policy,
-        "Converted PyTorch",
-        converted_policy,
-        samples,
-    )
-
-    # Trained PyTorch policy (LoRA-trained, different weights)
-    # srb_train uses LoRA variants which may not be available in PyTorch
-    try:
-        srb_train_dir = os.path.dirname(srb_train_checkpoint) if "model.safetensors" in srb_train_checkpoint else srb_train_checkpoint
-        srb_train_cfg = _config.get_config("srb_train")
-        srb_train_policy = policy_config.create_trained_policy(
-            srb_train_cfg,
-            srb_train_dir,
-            sample_kwargs={"num_steps": 10},
+        # Create policies
+        jax_cfg = _config.get_config("pi05_srb")
+        jax_policy = policy_config.create_trained_policy(
+            jax_cfg,
+            jax_checkpoint,
+            sample_kwargs={"num_steps": args.num_steps},
             pytorch_device="cpu",
         )
 
-        # Compare JAX vs trained PyTorch (different weights + different implementation)
-        compare_runtime_outputs(
+        # Converted PyTorch policy (same JAX weights, PyTorch implementation)
+        converted_dir = os.path.dirname(converted_checkpoint) if "model.safetensors" in converted_checkpoint else converted_checkpoint
+        converted_cfg = _config.get_config("pi05_srb")
+        converted_policy = policy_config.create_trained_policy(
+            converted_cfg,
+            converted_dir,
+            sample_kwargs={"num_steps": args.num_steps},
+            pytorch_device="cpu",
+        )
+
+        # Compare JAX vs converted PyTorch (same weights, different implementation)
+        results["runtime"]["jax_vs_converted"] = compare_runtime_outputs(
+            "JAX base",
+            jax_policy,
+            "Converted PyTorch",
+            converted_policy,
+            samples,
+            num_steps=args.num_steps,
+        )
+
+        # Trained PyTorch policy (LoRA-trained, different weights)
+        # srb_train uses LoRA variants which may not be available in PyTorch
+        try:
+            srb_train_dir = os.path.dirname(srb_train_checkpoint) if "model.safetensors" in srb_train_checkpoint else srb_train_checkpoint
+            srb_train_cfg = _config.get_config("srb_train")
+            srb_train_policy = policy_config.create_trained_policy(
+                srb_train_cfg,
+                srb_train_dir,
+                sample_kwargs={"num_steps": args.num_steps},
+                pytorch_device="cpu",
+            )
+
+            # Compare JAX vs trained PyTorch (different weights + different implementation)
+            results["runtime"]["jax_vs_srb_train"] = compare_runtime_outputs(
             "JAX base",
             jax_policy,
             "Trained srb_train",
             srb_train_policy,
             samples,
-        )
+                num_steps=args.num_steps,
+            )
 
         # Compare converted vs trained PyTorch (different weights, same implementation)
-        compare_runtime_outputs(
-            "Converted PyTorch",
-            converted_policy,
-            "Trained srb_train",
-            srb_train_policy,
-            samples,
-        )
-    except Exception as e:
-        print(f"\nSkipping srb_train policy (LoRA variants not available): {e}")
+            results["runtime"]["converted_vs_srb_train"] = compare_runtime_outputs(
+                "Converted PyTorch",
+                converted_policy,
+                "Trained srb_train",
+                srb_train_policy,
+                samples,
+                    num_steps=args.num_steps,
+            )
+        except Exception as e:
+            print(f"\nSkipping srb_train policy (LoRA variants not available): {e}")
 
     # ---------------------------------------------------------------
     # Part 3: Component-level comparison
@@ -416,21 +467,39 @@ def main():
     print("# PART 3: Component-level comparison (preprocessing)")
     print("#" * 80)
 
-    compare_component_outputs(
-        "JAX base",
-        jax_policy,
-        "Converted PyTorch",
-        converted_policy,
-        samples[0],
-    )
+    if not args.skip_component:
+        if args.skip_runtime:
+            from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
-    compare_component_outputs(
-        "JAX base",
-        jax_policy,
-        "Trained srb_train",
-        srb_train_policy,
-        samples[0],
-    )
+            ds = LeRobotDataset("srb_dataset")
+            samples = [ds[i] for i in range(min(args.samples, len(ds)))]
+        else:
+            samples = [ds[i] for i in range(min(args.samples, len(ds)))] if "ds" in locals() else []
+
+        if samples:
+            sample = samples[0]
+            compare_component_outputs(
+                "JAX base",
+                jax_policy,
+                "Converted PyTorch",
+                converted_policy,
+                sample,
+            )
+
+            if "srb_train_policy" in locals():
+                compare_component_outputs(
+                    "JAX base",
+                    jax_policy,
+                    "Trained srb_train",
+                    srb_train_policy,
+                    sample,
+                )
+        else:
+            print("No samples available for component comparison")
+    else:
+        print("Skipping component comparison as requested")
+
+    save_results(args.output_json, results)
 
     print("\n" + "=" * 80)
     print("Comparison complete.")
