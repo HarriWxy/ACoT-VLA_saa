@@ -465,6 +465,13 @@ torchrun --nproc_per_node=2 RLtune/train_offline.py [原有参数...]
 FSDP 会自动将模型参数、梯度、优化器状态分片到两张卡上，每张卡只需约 50% 的显存。 
 
 
+### Jax 版本 train_offline
+
+```bash
+cd /root/SpaceRobot/ACoT-VLA_saa
+.venv/bin/python -m RLtune.train_offline_jax --config-name srb_train_tracking --total-epochs 20 --num-train-steps-per-epoch 10
+```
+
 ---
 
 ## 快速检查清单

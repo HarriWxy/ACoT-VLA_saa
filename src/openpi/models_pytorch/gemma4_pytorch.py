@@ -131,6 +131,86 @@ def _gated_residual(x, y, gate):
     return x + y * gate
 
 
+def _patch_gemma4_decoder_layer_adarms():
+    """Allow Gemma4 decoder layers to consume an optional adarms condition."""
+    from transformers.models.gemma4.modeling_gemma4 import Gemma4TextDecoderLayer
+
+    if getattr(Gemma4TextDecoderLayer, "_openpi_adarms_patched", False):
+        return
+
+    def _apply_norm(norm_fn, hidden_states, cond):
+        if cond is None:
+            out = norm_fn(hidden_states)
+        else:
+            out = norm_fn(hidden_states, cond=cond)
+        return out[0] if isinstance(out, tuple) else out
+
+    def _patched_forward(
+        self,
+        hidden_states,
+        per_layer_input=None,
+        shared_kv_states=None,
+        position_embeddings=None,
+        attention_mask=None,
+        position_ids=None,
+        past_key_values=None,
+        **kwargs,
+    ):
+        cond = kwargs.pop("cond", None)
+        if cond is None and "adarms_cond" in kwargs:
+            cond = kwargs.pop("adarms_cond")
+
+        residual = hidden_states
+        hidden_states = _apply_norm(self.input_layernorm, hidden_states, cond)
+        hidden_states, _ = self.self_attn(
+            hidden_states=hidden_states,
+            position_embeddings=position_embeddings,
+            attention_mask=attention_mask,
+            shared_kv_states=shared_kv_states,
+            position_ids=position_ids,
+            past_key_values=past_key_values,
+            **kwargs,
+        )
+        hidden_states = _apply_norm(self.post_attention_layernorm, hidden_states, cond)
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = _apply_norm(self.pre_feedforward_layernorm, hidden_states, cond)
+        hidden_states = self.mlp(hidden_states)
+
+        if self.enable_moe_block:
+            hidden_states_1 = _apply_norm(self.post_feedforward_layernorm_1, hidden_states, cond)
+
+            hidden_states_flat = residual.reshape(-1, residual.shape[-1])
+            _, top_k_weights, top_k_index = self.router(hidden_states_flat)
+            hidden_states_2 = _apply_norm(self.pre_feedforward_layernorm_2, hidden_states_flat, cond)
+            hidden_states_2 = self.experts(hidden_states_2, top_k_index, top_k_weights)
+            hidden_states_2 = hidden_states_2.reshape(residual.shape)
+            hidden_states_2 = _apply_norm(self.post_feedforward_layernorm_2, hidden_states_2, cond)
+            hidden_states = hidden_states_1 + hidden_states_2
+
+        hidden_states = _apply_norm(self.post_feedforward_layernorm, hidden_states, cond)
+        hidden_states = residual + hidden_states
+
+        if self.hidden_size_per_layer_input:
+            residual = hidden_states
+            hidden_states = self.per_layer_input_gate(hidden_states)
+            hidden_states = self.act_fn(hidden_states)
+            hidden_states = hidden_states * per_layer_input
+            hidden_states = self.per_layer_projection(hidden_states)
+            hidden_states = _apply_norm(self.post_per_layer_input_norm, hidden_states, cond)
+            hidden_states = residual + hidden_states
+
+        hidden_states *= self.layer_scalar
+        return hidden_states
+
+    Gemma4TextDecoderLayer.forward = _patched_forward
+    Gemma4TextDecoderLayer._openpi_adarms_patched = True  # noqa: SLF001
+
+
+_patch_gemma4_decoder_layer_adarms()
+
+
 class Gemma4WithExpertModel(nn.Module):
     """Gemma-4 native multimodal + action expert model.
 
@@ -367,25 +447,31 @@ class Gemma4WithExpertModel(nn.Module):
             adarms_cond = [None, None]
         if inputs_embeds[1] is None:
             # VLM-only forward (prefix caching)
-            prefix_output = self.gemma4_vlm.model(
-                inputs_embeds=inputs_embeds[0],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-            )
+            model_kwargs = {
+                "inputs_embeds": inputs_embeds[0],
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+            }
+            if adarms_cond is not None and adarms_cond[0] is not None:
+                model_kwargs["adarms_cond"] = adarms_cond[0]
+            prefix_output = self.gemma4_vlm.model(**model_kwargs)
             prefix_past_key_values = prefix_output.past_key_values
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
             # Action expert-only forward (suffix with cached prefix)
-            suffix_output = self.gemma4_expert.model(
-                inputs_embeds=inputs_embeds[1],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-            )
+            model_kwargs = {
+                "inputs_embeds": inputs_embeds[1],
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "past_key_values": past_key_values,
+                "use_cache": use_cache,
+            }
+            if adarms_cond is not None and adarms_cond[1] is not None:
+                model_kwargs["adarms_cond"] = adarms_cond[1]
+            suffix_output = self.gemma4_expert.model(**model_kwargs)
             suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
@@ -479,8 +565,14 @@ class Gemma4WithExpertModel(nn.Module):
 
             # --- Input LayerNorm + Q/K/V projection ---
             # VLM branch: no_grad when frozen to avoid storing LoRA intermediates
+            vlm_cond = adarms_cond[0] if adarms_cond is not None else None
+            expert_cond = adarms_cond[1] if adarms_cond is not None else None
             with _vlm_ctx():
-                vlm_ln_out = vlm_layer.input_layernorm(vlm_hidden)
+                vlm_ln_out = (
+                    vlm_layer.input_layernorm(vlm_hidden, cond=vlm_cond)
+                    if vlm_cond is not None
+                    else vlm_layer.input_layernorm(vlm_hidden)
+                )
                 vlm_h, vlm_gate = (vlm_ln_out if isinstance(vlm_ln_out, tuple) else (vlm_ln_out, None))
                 input_shape_vlm = vlm_h.shape[:-1]
                 hidden_shape_vlm = (*input_shape_vlm, -1, vlm_layer.self_attn.head_dim)
@@ -490,7 +582,11 @@ class Gemma4WithExpertModel(nn.Module):
                 # del vlm_h  # input_layernorm output consumed by Q/K/V projections
 
             # Expert branch: always with grad
-            expert_ln_out = expert_layer.input_layernorm(expert_hidden)
+            expert_ln_out = (
+                expert_layer.input_layernorm(expert_hidden, cond=expert_cond)
+                if expert_cond is not None
+                else expert_layer.input_layernorm(expert_hidden)
+            )
             expert_h, expert_gate = (expert_ln_out if isinstance(expert_ln_out, tuple) else (expert_ln_out, None))
             input_shape_expert = expert_h.shape[:-1]
             hidden_shape_expert = (*input_shape_expert, -1, expert_layer.self_attn.head_dim)
@@ -588,16 +684,30 @@ class Gemma4WithExpertModel(nn.Module):
                 if frozen_vlm_path:
                     vlm_att_out = vlm_att_out.detach()
                 vlm_att_out = vlm_layer.self_attn.o_proj(vlm_att_out)
-                vlm_post_attn = vlm_layer.post_attention_layernorm(vlm_att_out)
+                vlm_post_attn = (
+                    vlm_layer.post_attention_layernorm(vlm_att_out, cond=vlm_cond)
+                    if vlm_cond is not None
+                    else vlm_layer.post_attention_layernorm(vlm_att_out)
+                )
                 vlm_post_attn, vlm_post_gate = (
                     vlm_post_attn if isinstance(vlm_post_attn, tuple) else (vlm_post_attn, None)
                 )
                 vlm_hidden = _gated_residual(vlm_hidden, vlm_post_attn, vlm_gate or vlm_post_gate)
 
                 residual = vlm_hidden
-                vlm_ff = vlm_layer.pre_feedforward_layernorm(vlm_hidden)
+                vlm_ff = (
+                    vlm_layer.pre_feedforward_layernorm(vlm_hidden, cond=vlm_cond)
+                    if vlm_cond is not None
+                    else vlm_layer.pre_feedforward_layernorm(vlm_hidden)
+                )
+                vlm_ff = vlm_ff[0] if isinstance(vlm_ff, tuple) else vlm_ff
                 vlm_ff = vlm_layer.mlp(vlm_ff)
-                vlm_ff = vlm_layer.post_feedforward_layernorm(vlm_ff)
+                vlm_ff = (
+                    vlm_layer.post_feedforward_layernorm(vlm_ff, cond=vlm_cond)
+                    if vlm_cond is not None
+                    else vlm_layer.post_feedforward_layernorm(vlm_ff)
+                )
+                vlm_ff = vlm_ff[0] if isinstance(vlm_ff, tuple) else vlm_ff
                 vlm_hidden = residual + vlm_ff
 
                 vlm_hidden = vlm_hidden * vlm_layer.layer_scalar
@@ -606,16 +716,30 @@ class Gemma4WithExpertModel(nn.Module):
             if expert_att_out.dtype != _get_weight(expert_layer.self_attn.o_proj).dtype:
                 expert_att_out = expert_att_out.to(_get_weight(expert_layer.self_attn.o_proj).dtype)
             expert_att_out = expert_layer.self_attn.o_proj(expert_att_out)
-            expert_post_attn = expert_layer.post_attention_layernorm(expert_att_out)
+            expert_post_attn = (
+                expert_layer.post_attention_layernorm(expert_att_out, cond=expert_cond)
+                if expert_cond is not None
+                else expert_layer.post_attention_layernorm(expert_att_out)
+            )
             expert_post_attn, expert_post_gate = (
                 expert_post_attn if isinstance(expert_post_attn, tuple) else (expert_post_attn, None)
             )
             expert_hidden = _gated_residual(expert_hidden, expert_post_attn, expert_gate or expert_post_gate)
 
             residual = expert_hidden
-            expert_ff = expert_layer.pre_feedforward_layernorm(expert_hidden)
+            expert_ff = (
+                expert_layer.pre_feedforward_layernorm(expert_hidden, cond=expert_cond)
+                if expert_cond is not None
+                else expert_layer.pre_feedforward_layernorm(expert_hidden)
+            )
+            expert_ff = expert_ff[0] if isinstance(expert_ff, tuple) else expert_ff
             expert_ff = expert_layer.mlp(expert_ff)
-            expert_ff = expert_layer.post_feedforward_layernorm(expert_ff)
+            expert_ff = (
+                expert_layer.post_feedforward_layernorm(expert_ff, cond=expert_cond)
+                if expert_cond is not None
+                else expert_layer.post_feedforward_layernorm(expert_ff)
+            )
+            expert_ff = expert_ff[0] if isinstance(expert_ff, tuple) else expert_ff
             expert_hidden = residual + expert_ff
 
             expert_hidden = expert_hidden * expert_layer.layer_scalar

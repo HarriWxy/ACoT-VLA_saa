@@ -1,0 +1,339 @@
+"""JAX offline RL training for ACoT-VLA using pre-collected demonstration data.
+
+This script mirrors the logic in RLtune/train.py but replaces online rollout
+collection with offline episode sampling from the standard LeRobot data pipeline.
+It is intended as a lightweight JAX version of the PyTorch offline GRPO trainer.
+
+Usage:
+    python -m RLtune.train_offline_jax --config_name srb_train_tracking
+"""
+
+from __future__ import annotations
+
+import dataclasses
+import functools
+import logging
+import os
+import pathlib
+import platform
+import sys
+import time
+from typing import Literal
+
+# Ensure project root is in sys.path.
+_PROJECT_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import wandb
+
+import openpi.models.model as _model
+import openpi.training.checkpoints as _checkpoints
+import openpi.training.config as _config
+import openpi.training.data_loader as _data_loader
+import openpi.training.sharding as sharding
+import openpi.training.utils as training_utils
+
+from RLtune.episode_dataset import EpisodeAwareDataset
+from RLtune.grpo_algo import compute_advantages
+from RLtune.grpo_algo import filter_by_accuracy
+from RLtune.train import init_logging
+from RLtune.train import init_train_state
+from RLtune.train import offline_rl_train_step
+
+
+@dataclasses.dataclass(frozen=True)
+class OfflineJAXConfig:
+    """Minimal configuration for JAX offline RL training."""
+
+    n_samples: int = 4
+    clip_ratio_high: float = 0.28
+    clip_ratio_low: float = 0.2
+    gamma: float = 1.0
+    adv_estimator: Literal["grpo", "rloo", "reinforce_plus_plus"] = "grpo"
+
+    filter_by_accuracy: bool = False
+    accuracy_lower_bound: float = 0.1
+    accuracy_upper_bound: float = 0.9
+
+    total_epochs: int = 20
+    num_train_steps_per_epoch: int = 10
+    learning_rate: float = 5e-6
+    grad_clip_norm: float = 1.0
+    weight_decay: float = 1e-4
+
+    reward_aggregation: Literal["sum", "mean", "last", "binary_sum"] = "sum"
+    reward_threshold: float = 0.0
+    frames_per_episode: int = 2
+    batch_size: int = 32
+
+    config_name: str = "srb_train_tracking"
+    checkpoint_dir: str | None = None
+    action_horizon: int = 16
+    action_dim: int = 19
+    seed: int = 42
+    log_interval: int = 1
+    save_interval: int = 5
+    wandb_enabled: bool = True
+    fsdp_devices: int | None = None
+
+
+def prepare_advantages(advantages: jnp.ndarray, *, batch_size: int) -> jnp.ndarray:
+    """Repeat or truncate advantages so they match a batch size."""
+    advantages = jnp.asarray(advantages, dtype=jnp.float32)
+    if advantages.size == 0:
+        return jnp.zeros((batch_size,), dtype=jnp.float32)
+    if advantages.size >= batch_size:
+        return advantages[:batch_size]
+
+    repeats = (batch_size + advantages.size - 1) // advantages.size
+    return jnp.tile(advantages, repeats)[:batch_size]
+
+
+def _to_jax_array(value):
+    if isinstance(value, (np.ndarray,)):
+        return jnp.asarray(value)
+    if hasattr(value, "detach") and hasattr(value, "cpu"):
+        return jnp.asarray(value.detach().cpu().numpy())
+    if isinstance(value, (list, tuple)):
+        return jnp.asarray(value)
+    return value
+
+
+def _prepare_batch_for_sharding(observation, actions, *, mesh, batch_sharding, data_sharding):
+    """Move the observation/action batch onto the configured sharding."""
+    observation = jax.tree.map(lambda x: jax.device_put(x, batch_sharding), observation)
+    actions = jax.device_put(actions, batch_sharding)
+    return observation, actions
+
+
+def init_wandb(rl_config: OfflineJAXConfig, base_config: _config.TrainConfig, *, resuming: bool, enabled: bool = True):
+    """Initialize wandb logging for the offline RL run."""
+    if not enabled:
+        wandb.init(mode="disabled")
+        return
+
+    if jax.process_index() != 0:
+        wandb.init(mode="disabled")
+        return
+
+    ckpt_dir = base_config.checkpoint_dir
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+
+    if resuming:
+        run_id = (ckpt_dir / "wandb_id.txt").read_text().strip()
+        wandb.init(id=run_id, resume="must", project=f"{base_config.project_name}_rl")
+    else:
+        wandb.init(
+            name=f"rl_offline_jax_{base_config.exp_name}",
+            config={**dataclasses.asdict(rl_config), "base_config": dataclasses.asdict(base_config)},
+            project=f"{base_config.project_name}_rl",
+        )
+        (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+
+
+def maybe_initialize_distributed() -> None:
+    """Initialize JAX distributed runtime when launched under multi-process settings."""
+    if jax.distributed.is_initialized():
+        return
+
+    coordinator_address = os.environ.get("JAX_COORDINATOR_ADDRESS")
+    if not coordinator_address:
+        master_addr = os.environ.get("MASTER_ADDR")
+        master_port = os.environ.get("MASTER_PORT")
+        if master_addr and master_port:
+            coordinator_address = f"{master_addr}:{master_port}"
+
+    num_processes = os.environ.get("JAX_NUM_PROCESSES") or os.environ.get("WORLD_SIZE")
+    process_id = os.environ.get("JAX_PROCESS_ID") or os.environ.get("RANK")
+
+    if coordinator_address and num_processes and process_id:
+        jax.distributed.initialize(
+            coordinator_address=coordinator_address,
+            num_processes=int(num_processes),
+            process_id=int(process_id),
+        )
+
+
+def build_episode_dataset(base_config: _config.TrainConfig, rl_config: OfflineJAXConfig) -> EpisodeAwareDataset:
+    """Build the episode-aware dataset from the standard data pipeline."""
+    data_config = base_config.data.create(base_config.assets_dirs, base_config.model)
+    raw_dataset = _data_loader.create_torch_dataset(data_config, base_config.model.action_horizon, base_config.model)
+    transformed_dataset = _data_loader.transform_dataset(raw_dataset, data_config, skip_norm_stats=False)
+
+    return EpisodeAwareDataset(
+        transformed_dataset,
+        reward_aggregation=rl_config.reward_aggregation,
+        reward_threshold=rl_config.reward_threshold,
+    )
+
+
+def main(rl_config: OfflineJAXConfig):
+    """Main offline RL training loop."""
+    init_logging()
+    maybe_initialize_distributed()
+
+    logging.info(f"Running JAX offline RL on: {platform.node()}")
+    logging.info(
+        "JAX distributed info: process=%d/%d local_devices=%d global_devices=%d",
+        jax.process_index(),
+        jax.process_count(),
+        jax.local_device_count(),
+        jax.device_count(),
+    )
+    logging.info(f"Offline RL config: {dataclasses.asdict(rl_config)}")
+
+    base_config = _config.get_config(rl_config.config_name)
+    if rl_config.checkpoint_dir:
+        base_config = dataclasses.replace(
+            base_config,
+            checkpoint_dir_override=pathlib.Path(rl_config.checkpoint_dir),
+        )
+
+    if base_config.model.action_horizon != rl_config.action_horizon:
+        object.__setattr__(base_config.model, "action_horizon", rl_config.action_horizon)
+
+    rng = jax.random.PRNGKey(rl_config.seed + jax.process_index())
+    train_rng, init_rng = jax.random.split(rng)
+
+    num_fsdp_devices = rl_config.fsdp_devices or base_config.fsdp_devices
+    mesh = sharding.make_mesh(num_fsdp_devices)
+    batch_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.BATCH_AXIS))
+    replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    rl_ckpt_dir = base_config.checkpoint_dir / "rl_grpo_offline_jax"
+    checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
+        rl_ckpt_dir,
+        keep_period=rl_config.save_interval,
+        overwrite=False,
+        resume=True,
+    )
+
+    init_wandb(rl_config, base_config, resuming=resuming, enabled=rl_config.wandb_enabled)
+
+    train_state, train_state_sharding = init_train_state(base_config, init_rng, mesh, resume=resuming)
+    jax.block_until_ready(train_state)
+    logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
+
+    if resuming:
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, None)
+
+    ptrain_step = jax.jit(
+        functools.partial(offline_rl_train_step, base_config),
+        in_shardings=(replicated_sharding, train_state_sharding, batch_sharding, replicated_sharding),
+        out_shardings=(train_state_sharding, replicated_sharding),
+        donate_argnums=(1,),
+    )
+
+    dataset = build_episode_dataset(base_config, rl_config)
+    logging.info(
+        f"Offline dataset ready: {dataset.total_episodes} episodes, {dataset.total_frames} frames"
+    )
+
+    np_rng = np.random.default_rng(rl_config.seed + jax.process_index())
+    best_reward = -float("inf")
+
+    for epoch in range(rl_config.total_epochs):
+        epoch_start = time.time()
+        logging.info(f"\n{'=' * 60}")
+        logging.info(f"Epoch {epoch + 1}/{rl_config.total_epochs}")
+        logging.info(f"{'=' * 60}")
+
+        group = dataset.sample_episodes_for_grpo(
+            n_groups=1,
+            n_samples_per_group=rl_config.n_samples,
+            rng=np_rng,
+        )[0]
+
+        rewards = np.array([dataset.get_episode_reward(ep_idx) for ep_idx in group], dtype=np.float32)
+        prompt_indices = np.zeros(len(group), dtype=np.int16)
+
+        if rl_config.filter_by_accuracy:
+            binary_rewards = np.array([1.0 if dataset.get_episode_success(ep_idx) else 0.0 for ep_idx in group])
+            mask, filter_metrics = filter_by_accuracy(
+                binary_rewards,
+                prompt_indices,
+                lower_bound=rl_config.accuracy_lower_bound,
+                upper_bound=rl_config.accuracy_upper_bound,
+            )
+            logging.info(f"Filter metrics: {filter_metrics}")
+            if mask.sum() == 0:
+                logging.warning("All episodes filtered out; skipping epoch.")
+                continue
+            filtered_indices = np.where(mask)[0]
+            group = [group[i] for i in filtered_indices]
+            rewards = rewards[filtered_indices]
+            prompt_indices = prompt_indices[filtered_indices]
+
+        advantages = compute_advantages(
+            rewards,
+            prompt_indices,
+            estimator=rl_config.adv_estimator,
+            n_samples=rl_config.n_samples,
+            gamma=rl_config.gamma,
+        )
+        logging.info(
+            f"Episode rewards: mean={rewards.mean():.4f}, std={rewards.std():.4f}, "
+            f"adv_mean={advantages.mean():.4f}, adv_std={advantages.std():.4f}"
+        )
+
+        step_infos = []
+        local_batch_size = max(1, rl_config.batch_size // max(1, jax.process_count()))
+        target_group_size = max(1, min(len(group), max(1, local_batch_size // max(1, rl_config.frames_per_episode))))
+        step_group = group[:target_group_size]
+
+        for step in range(rl_config.num_train_steps_per_epoch):
+            obs_batch, actions_np, _ = dataset.sample_batch_from_episodes(
+                step_group,
+                frames_per_episode=rl_config.frames_per_episode,
+                rng=np_rng,
+            )
+
+            obs_dict = jax.tree.map(_to_jax_array, obs_batch.to_dict())
+            observation = _model.Observation.from_dict(obs_dict)
+            actions = jnp.asarray(actions_np, dtype=jnp.float32)
+            adv_jax = prepare_advantages(jnp.asarray(advantages, dtype=jnp.float32), batch_size=actions.shape[0])
+            observation, actions = _prepare_batch_for_sharding(
+                observation, actions, mesh=mesh, batch_sharding=batch_sharding, data_sharding=batch_sharding
+            )
+            adv_jax = jax.device_put(adv_jax, batch_sharding)
+
+            train_rng, step_rng = jax.random.split(train_rng)
+            with sharding.set_mesh(mesh):
+                train_state, info = ptrain_step(step_rng, train_state, (observation, actions), adv_jax)
+            step_infos.append(info)
+
+            if step % rl_config.log_interval == 0:
+                stacked = jax.tree.map(lambda *xs: jnp.mean(jnp.stack(xs)), *step_infos)
+                reduced = jax.device_get(stacked)
+                logging.info(f"  Step {step}: {', '.join(f'{k}={v:.4f}' for k, v in reduced.items())}")
+                step_infos = []
+
+        epoch_time = time.time() - epoch_start
+        logging.info(f"Epoch completed in {epoch_time:.2f}s")
+
+        mean_reward = float(np.mean(rewards))
+        if mean_reward > best_reward:
+            best_reward = mean_reward
+            logging.info(f"New best reward: {best_reward:.4f}")
+
+        if (epoch + 1) % rl_config.save_interval == 0:
+            if jax.process_index() == 0:
+                logging.info(f"Saving checkpoint at epoch {epoch + 1}...")
+                _checkpoints.save_state(checkpoint_manager, train_state, None, epoch + 1)
+                wandb.log({"epoch": epoch + 1, "best_reward": best_reward}, step=epoch + 1)
+
+    if jax.process_index() == 0:
+        logging.info("Training complete. Saving final checkpoint...")
+        _checkpoints.save_state(checkpoint_manager, train_state, None, rl_config.total_epochs)
+        checkpoint_manager.wait_until_finished()
+        wandb.log({"best_reward": best_reward}, step=rl_config.total_epochs)
+
+
+if __name__ == "__main__":
+    import tyro
+
+    tyro.cli(OfflineJAXConfig, default=main)

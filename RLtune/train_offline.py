@@ -277,9 +277,9 @@ class OfflineGRPOConfig:
     frames_per_episode: int = 2  # Frames sampled per episode per training step
 
     # ── Model / checkpoint ──
-    config_name: str = "srb_train_gemma4" #  srb_train_tracking
+    config_name: str = "srb_train_tracking" #  srb_train_gemma4  
     checkpoint_dir: str | None = None
-    action_horizon: int = 1
+    action_horizon: int = 16
     action_dim: int = 19
 
     # ── Projection Head ──

@@ -33,6 +33,7 @@ from .reward_manager import RewardManager
 from .reward_manager import create_reward_manager
 from .rl_config import EnvConfig
 from .rl_config import GRPOConfig
+from .train_offline_jax import OfflineJAXConfig
 
 __all__ = [
     "EnvConfig",
