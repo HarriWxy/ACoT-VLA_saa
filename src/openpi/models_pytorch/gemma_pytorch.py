@@ -75,7 +75,8 @@ def _patched_rmsnorm_init(self, dim: int, eps: float = 1e-6, cond_dim: Optional[
 def _patched_rmsnorm_forward(self, x, cond=None):
     """Extended forward that supports an optional `cond` (adaRMS conditioning).
 
-    Returns (hidden_states, gate) where gate is None when cond is None.
+    Returns a tensor in the standard path (matching upstream transformers) and
+    returns a `(hidden_states, gate)` tuple only when adaRMS conditioning is used.
     """
     dtype = x.dtype
     # RMSNorm computation (in float32 for numerical stability)
@@ -83,9 +84,9 @@ def _patched_rmsnorm_forward(self, x, cond=None):
     normed = x * torch.rsqrt(var + self.eps)
 
     if cond is None or self.dense is None:
-        # Standard RMSNorm path
+        # Standard RMSNorm path: preserve the upstream API.
         out = normed * (1.0 + self.weight.float())
-        return out.to(dtype), None
+        return out.to(dtype)
 
     # adaRMS path: generate scale / shift / gate from the conditioning vector
     modulation = self.dense(cond.to(next(self.parameters()).dtype))
@@ -244,9 +245,19 @@ class PaliGemmaWithExpertModel(nn.Module):
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
+
+        def _match_dtype(embeds: torch.Tensor | None, target_module: nn.Module | None) -> torch.Tensor | None:
+            if embeds is None or target_module is None:
+                return embeds
+            target_dtype = next(target_module.parameters()).dtype
+            if embeds.dtype != target_dtype:
+                embeds = embeds.to(dtype=target_dtype)
+            return embeds
+
         if inputs_embeds[1] is None:
+            prefix_inputs = _match_dtype(inputs_embeds[0], self.paligemma.language_model)
             prefix_output = self.paligemma.language_model.forward(
-                inputs_embeds=inputs_embeds[0],
+                inputs_embeds=prefix_inputs,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -257,15 +268,45 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            suffix_output = self.gemma_expert.model.forward(
-                inputs_embeds=inputs_embeds[1],
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_values=past_key_values,
-                use_cache=use_cache,
-                adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
-            )
-            suffix_output = suffix_output.last_hidden_state
+            # Suffix-only path: expert processes suffix tokens using VLM's cached KV.
+            # We must manually iterate through layers to apply adaRMS conditioning
+            # (adarms_cond) and gated residuals at each layer, which HuggingFace's
+            # GemmaModel.forward() does NOT support.
+            suffix_inputs = _match_dtype(inputs_embeds[1], self.gemma_expert.model)
+            expert = self.gemma_expert.model
+            expert_adarms = adarms_cond[1] if adarms_cond is not None else None
+
+            hidden_states = suffix_inputs
+            position_embeddings = expert.rotary_emb(hidden_states, position_ids=position_ids)
+
+            for layer in expert.layers:
+                residual = hidden_states
+                hidden_states, gate = layer.input_layernorm(hidden_states, cond=expert_adarms)
+
+                weight_dtype = layer.self_attn.q_proj.weight.dtype
+                if hidden_states.dtype != weight_dtype:
+                    hidden_states = hidden_states.to(dtype=weight_dtype)
+
+                # Self-attention with cached VLM KV
+                hidden_states_attn, _ = layer.self_attn(
+                    hidden_states=hidden_states,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_values=past_key_values,
+                    use_cache=False,
+                    position_embeddings=position_embeddings,
+                )
+                hidden_states = modeling_gemma._gated_residual(residual, hidden_states_attn, gate)
+
+                # MLP
+                residual = hidden_states
+                hidden_states, gate = layer.post_attention_layernorm(hidden_states, cond=expert_adarms)
+                if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
+                    hidden_states = hidden_states.to(dtype=torch.bfloat16)
+                hidden_states = layer.mlp(hidden_states)
+                hidden_states = modeling_gemma._gated_residual(residual, hidden_states, gate)
+
+            suffix_output, _ = expert.norm(hidden_states, cond=expert_adarms)
             prefix_output = None
             prefix_past_key_values = None
         else:
@@ -311,6 +352,10 @@ class PaliGemmaWithExpertModel(nn.Module):
                     layer = models[i].layers[layer_idx]
                     hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
                     gates.append(gate)
+
+                    weight_dtype = layer.self_attn.q_proj.weight.dtype
+                    if hidden_states.dtype != weight_dtype:
+                        hidden_states = hidden_states.to(dtype=weight_dtype)
 
                     input_shape = hidden_states.shape[:-1]
                     hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)

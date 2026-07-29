@@ -564,6 +564,7 @@ class PI0Pytorch(nn.Module):
 
         pad_masks = torch.cat([prefix_pad_masks, suffix_pad_masks], dim=1)
         att_masks = torch.cat([prefix_att_masks, suffix_att_masks], dim=1)
+        # batch x 6360() / 8 x 6345 / 16 x 12504
 
         att_2d_masks = make_att_2d_masks(pad_masks, att_masks)
         position_ids = torch.cumsum(pad_masks, dim=1) - 1 # position_ids shape: [batch_size, seq_len] 
@@ -667,9 +668,22 @@ class PI0Pytorch(nn.Module):
         dt = -1.0 / num_steps
         dt = torch.tensor(dt, dtype=torch.float32, device=device)
 
+        # transformers ≥5.x DynamicCache.update() mutates the cache in-place
+        # during each denoise step, appending suffix KV to the cached prefix KV.
+        # We must restore the prefix-only cache before each step so the
+        # attention mask dimensions stay consistent across all denoise steps.
+        _prefix_cache_len = 0
+        if past_key_values is not None and hasattr(past_key_values, "layers"):
+            _prefix_cache_len = past_key_values.get_seq_length(layer_idx=0)
+
         x_t = noise
         time = torch.tensor(1.0, dtype=torch.float32, device=device)
         while time >= -dt / 2:
+            # Restore prefix-only KV cache before each denoise step.
+            # crop() keeps the first N entries, which are the prefix tokens.
+            if _prefix_cache_len > 0:
+                past_key_values.crop(_prefix_cache_len)
+
             expanded_time = time.expand(bsize)
             v_t = self.denoise_step(
                 state,
