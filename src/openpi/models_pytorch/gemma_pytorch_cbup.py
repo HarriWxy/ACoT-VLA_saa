@@ -75,8 +75,7 @@ def _patched_rmsnorm_init(self, dim: int, eps: float = 1e-6, cond_dim: Optional[
 def _patched_rmsnorm_forward(self, x, cond=None):
     """Extended forward that supports an optional `cond` (adaRMS conditioning).
 
-    Returns a tensor in the standard path (matching upstream transformers) and
-    returns a `(hidden_states, gate)` tuple only when adaRMS conditioning is used.
+    Returns (hidden_states, gate) where gate is None when cond is None.
     """
     dtype = x.dtype
     # RMSNorm computation (in float32 for numerical stability)
@@ -84,7 +83,7 @@ def _patched_rmsnorm_forward(self, x, cond=None):
     normed = x * torch.rsqrt(var + self.eps)
 
     if cond is None or self.dense is None:
-        # Standard RMSNorm path: preserve the upstream API.
+        # Standard RMSNorm path
         out = normed * (1.0 + self.weight.float())
         return out.to(dtype), None
 
@@ -433,19 +432,9 @@ class PaliGemmaWithExpertModel(nn.Module):
     ):
         if adarms_cond is None:
             adarms_cond = [None, None]
-
-        def _match_dtype(embeds: torch.Tensor | None, target_module: nn.Module | None) -> torch.Tensor | None:
-            if embeds is None or target_module is None:
-                return embeds
-            target_dtype = next(target_module.parameters()).dtype
-            if embeds.dtype != target_dtype:
-                embeds = embeds.to(dtype=target_dtype)
-            return embeds
-
         if inputs_embeds[1] is None:
-            prefix_inputs = _match_dtype(inputs_embeds[0], self.paligemma.language_model)
             prefix_output = self.paligemma.language_model.forward(
-                inputs_embeds=prefix_inputs,
+                inputs_embeds=inputs_embeds[0],
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
@@ -456,45 +445,15 @@ class PaliGemmaWithExpertModel(nn.Module):
             prefix_output = prefix_output.last_hidden_state
             suffix_output = None
         elif inputs_embeds[0] is None:
-            # Suffix-only path: expert processes suffix tokens using VLM's cached KV.
-            # We must manually iterate through layers to apply adaRMS conditioning
-            # (adarms_cond) and gated residuals at each layer, which HuggingFace's
-            # GemmaModel.forward() does NOT support.
-            suffix_inputs = _match_dtype(inputs_embeds[1], self.gemma_expert.model)
-            expert = self.gemma_expert.model
-            expert_adarms = adarms_cond[1] if adarms_cond is not None else None
-
-            hidden_states = suffix_inputs
-            position_embeddings = expert.rotary_emb(hidden_states, position_ids=position_ids)
-
-            for layer in expert.layers:
-                residual = hidden_states
-                hidden_states, gate = layer.input_layernorm(hidden_states, cond=expert_adarms)
-
-                weight_dtype = layer.self_attn.q_proj.weight.dtype
-                if hidden_states.dtype != weight_dtype:
-                    hidden_states = hidden_states.to(dtype=weight_dtype)
-
-                # Self-attention with cached VLM KV
-                hidden_states_attn, _ = layer.self_attn(
-                    hidden_states=hidden_states,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    use_cache=False,
-                    position_embeddings=position_embeddings,
-                )
-                hidden_states = modeling_gemma._gated_residual(residual, hidden_states_attn, gate)
-
-                # MLP
-                residual = hidden_states
-                hidden_states, gate = layer.post_attention_layernorm(hidden_states, cond=expert_adarms)
-                if layer.mlp.up_proj.weight.dtype == torch.bfloat16:
-                    hidden_states = hidden_states.to(dtype=torch.bfloat16)
-                hidden_states = layer.mlp(hidden_states)
-                hidden_states = modeling_gemma._gated_residual(residual, hidden_states, gate)
-
-            suffix_output, _ = expert.norm(hidden_states, cond=expert_adarms)
+            suffix_output = self.gemma_expert.model.forward(
+                inputs_embeds=inputs_embeds[1],
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=past_key_values,
+                use_cache=use_cache,
+                adarms_cond=adarms_cond[1] if adarms_cond is not None else None,
+            )
+            suffix_output = suffix_output.last_hidden_state
             prefix_output = None
             prefix_past_key_values = None
         else:
@@ -559,10 +518,6 @@ class PaliGemmaWithExpertModel(nn.Module):
                     hidden_states, gate = layer.input_layernorm(hidden_states, cond=adarms_cond[i])  # noqa: PLW2901
                     gates.append(gate)
 
-                    weight_dtype = layer.self_attn.q_proj.weight.dtype
-                    if hidden_states.dtype != weight_dtype:
-                        hidden_states = hidden_states.to(dtype=weight_dtype)
-
                     input_shape = hidden_states.shape[:-1]
                     hidden_shape = (*input_shape, -1, layer.self_attn.head_dim)
                     query_state = layer.self_attn.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
@@ -582,19 +537,6 @@ class PaliGemmaWithExpertModel(nn.Module):
                 query_states = torch.cat(query_states, dim=2)
                 key_states = torch.cat(key_states, dim=2)
                 value_states = torch.cat(value_states, dim=2)
-
-                dummy_tensor = torch.zeros(
-                    query_states.shape[0],
-                    query_states.shape[2],
-                    query_states.shape[-1],
-                    device=query_states.device,
-                    dtype=query_states.dtype,
-                )
-                cos, sin = self.paligemma.model.language_model.rotary_emb(dummy_tensor, position_ids)
-                query_states, key_states = modeling_gemma.apply_rotary_pos_emb(
-                    query_states, key_states, cos, sin, unsqueeze_dim=1
-                )
-
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
@@ -628,7 +570,8 @@ class PaliGemmaWithExpertModel(nn.Module):
                     out_emb = layer.self_attn.o_proj(attn_output_slice)
 
                     # first residual
-                    out_emb = modeling_gemma._gated_residual(hidden_states, out_emb, gates[i])  # noqa: SLF001
+                    residual = hidden_states
+                    out_emb = modeling_gemma._gated_residual(residual, out_emb, gates[i])  # noqa: SLF001
                     after_first_residual = out_emb.clone()
                     out_emb, gate = layer.post_attention_layernorm(out_emb, cond=adarms_cond[i])
                     # Convert to bfloat16 if the next layer (mlp) uses bfloat16
