@@ -41,7 +41,7 @@ from openpi.policies import policy_config
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare JAX and PyTorch checkpoints for weight and runtime consistency")
-    parser.add_argument("--samples", type=int, default=5, help="Number of SRB samples to evaluate")
+    parser.add_argument("--samples", type=int, default=16, help="Number of SRB samples to evaluate")
     parser.add_argument("--num-steps", type=int, default=10, help="Number of denoising steps for policy inference")
     parser.add_argument("--output-json", type=str, default=None, help="Optional path to save a JSON summary")
     parser.add_argument("--skip-weight", action="store_true", help="Skip weight-level comparison")

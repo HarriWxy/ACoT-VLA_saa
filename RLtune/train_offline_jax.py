@@ -30,6 +30,11 @@ import jax.numpy as jnp
 import numpy as np
 import wandb
 
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except ImportError:  # pragma: no cover - optional dependency fallback
+    SummaryWriter = None
+
 import openpi.models.model as _model
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
@@ -44,6 +49,7 @@ from RLtune.train import init_logging
 from RLtune.train import init_train_state
 from RLtune.train import offline_rl_train_step
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Disable GPU usage for JAX offline RL training.
 
 @dataclasses.dataclass(frozen=True)
 class OfflineJAXConfig:
@@ -77,7 +83,8 @@ class OfflineJAXConfig:
     seed: int = 42
     log_interval: int = 1
     save_interval: int = 5
-    wandb_enabled: bool = True
+    wandb_enabled: bool = False
+    tensorboard_enabled: bool = True
     fsdp_devices: int | None = None
 
 
@@ -133,6 +140,33 @@ def init_wandb(rl_config: OfflineJAXConfig, base_config: _config.TrainConfig, *,
             project=f"{base_config.project_name}_rl",
         )
         (ckpt_dir / "wandb_id.txt").write_text(wandb.run.id)
+
+
+def init_tensorboard(
+    rl_config: OfflineJAXConfig,
+    base_config: _config.TrainConfig,
+    *,
+    resuming: bool,
+    enabled: bool = True,
+):
+    """Initialize TensorBoard logging for the offline RL run."""
+    if not enabled or SummaryWriter is None:
+        return None
+
+    if jax.process_index() != 0:
+        return None
+
+    log_dir = base_config.checkpoint_dir / "rl_grpo_offline_jax" / "tensorboard"
+    log_dir.mkdir(parents=True, exist_ok=True)
+
+    writer = SummaryWriter(log_dir=str(log_dir))
+    hparams_text = (
+        f"## Offline JAX RL Config\n```json\n{dataclasses.asdict(rl_config)}\n```\n\n"
+        f"## Base Config\n{rl_config.config_name}"
+    )
+    writer.add_text("hyperparameters", hparams_text)
+    logging.info(f"TensorBoard logs -> {log_dir}")
+    return writer
 
 
 def maybe_initialize_distributed() -> None:
@@ -212,7 +246,14 @@ def main(rl_config: OfflineJAXConfig):
         resume=True,
     )
 
-    init_wandb(rl_config, base_config, resuming=resuming, enabled=rl_config.wandb_enabled)
+    writer = init_tensorboard(
+        rl_config,
+        base_config,
+        resuming=resuming,
+        enabled=rl_config.tensorboard_enabled,
+    )
+
+    # init_wandb(rl_config, base_config, resuming=resuming, enabled=rl_config.wandb_enabled)
 
     train_state, train_state_sharding = init_train_state(base_config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
@@ -310,6 +351,14 @@ def main(rl_config: OfflineJAXConfig):
                 stacked = jax.tree.map(lambda *xs: jnp.mean(jnp.stack(xs)), *step_infos)
                 reduced = jax.device_get(stacked)
                 logging.info(f"  Step {step}: {', '.join(f'{k}={v:.4f}' for k, v in reduced.items())}")
+                if writer is not None:
+                    global_step = epoch * rl_config.num_train_steps_per_epoch + step + 1
+                    for key, value in reduced.items():
+                        try:
+                            writer.add_scalar(f"train/{key}", float(value), global_step)
+                        except (TypeError, ValueError):
+                            continue
+                    writer.flush()
                 step_infos = []
 
         epoch_time = time.time() - epoch_start
@@ -320,20 +369,27 @@ def main(rl_config: OfflineJAXConfig):
             best_reward = mean_reward
             logging.info(f"New best reward: {best_reward:.4f}")
 
+        if writer is not None:
+            writer.add_scalar("epoch/mean_reward", mean_reward, epoch + 1)
+            writer.add_scalar("epoch/advantage_mean", float(np.mean(advantages)), epoch + 1)
+            writer.add_scalar("epoch/advantage_std", float(np.std(advantages)), epoch + 1)
+            writer.flush()
+
         if (epoch + 1) % rl_config.save_interval == 0:
             if jax.process_index() == 0:
                 logging.info(f"Saving checkpoint at epoch {epoch + 1}...")
                 _checkpoints.save_state(checkpoint_manager, train_state, None, epoch + 1)
-                wandb.log({"epoch": epoch + 1, "best_reward": best_reward}, step=epoch + 1)
+                # wandb.log({"epoch": epoch + 1, "best_reward": best_reward}, step=epoch + 1)
 
     if jax.process_index() == 0:
         logging.info("Training complete. Saving final checkpoint...")
         _checkpoints.save_state(checkpoint_manager, train_state, None, rl_config.total_epochs)
         checkpoint_manager.wait_until_finished()
-        wandb.log({"best_reward": best_reward}, step=rl_config.total_epochs)
+        # wandb.log({"best_reward": best_reward}, step=rl_config.total_epochs)
 
 
 if __name__ == "__main__":
-    import tyro
+    # import tyro
 
-    tyro.cli(OfflineJAXConfig, default=main)
+    # tyro.cli(OfflineJAXConfig, default=main)
+    main(OfflineJAXConfig())

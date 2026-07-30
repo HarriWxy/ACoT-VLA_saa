@@ -29,6 +29,33 @@ import openpi.models.model as _model
 logger = logging.getLogger(__name__)
 
 
+def _to_numpy_array(value: Any) -> Any:
+    """Convert torch tensors or lists to numpy arrays for model-side collation."""
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu().numpy()
+    if isinstance(value, np.ndarray):
+        return value
+    return np.asarray(value)
+
+
+def _normalize_image_layout(image: Any) -> Any:
+    """Normalize image tensors to channels-last layout for the model input pipeline."""
+    if isinstance(image, torch.Tensor):
+        if image.ndim == 4 and image.shape[1] in {1, 3} and image.shape[-1] not in {1, 3}:
+            return image.permute(0, 2, 3, 1)
+        if image.ndim == 3 and image.shape[0] in {1, 3} and image.shape[1] not in {1, 3} and image.shape[2] not in {1, 3}:
+            return image.permute(1, 2, 0)
+        return image
+
+    if isinstance(image, np.ndarray):
+        if image.ndim == 4 and image.shape[1] in {1, 3} and image.shape[-1] not in {1, 3}:
+            return np.moveaxis(image, 1, -1)
+        if image.ndim == 3 and image.shape[0] in {1, 3} and image.shape[1] not in {1, 3} and image.shape[2] not in {1, 3}:
+            return np.moveaxis(image, 0, -1)
+
+    return image
+
+
 class EpisodeAwareDataset:
     """Wraps a standard LeRobot dataset with episode-level access for RL.
 
@@ -224,7 +251,19 @@ class EpisodeAwareDataset:
 
             for sample_idx in chosen:
                 # Model inputs from transformed dataset
-                all_observations.append(self._transformed[sample_idx])
+                sample_obs = self._transformed[sample_idx]
+                if isinstance(sample_obs, dict) and isinstance(sample_obs.get("image"), dict):
+                    sample_obs = dict(sample_obs)
+                    sample_obs["image"] = {
+                        key: _normalize_image_layout(value) for key, value in sample_obs["image"].items()
+                    }
+                    image_masks = sample_obs.get("image_mask")
+                    if isinstance(image_masks, dict):
+                        sample_obs["image_mask"] = {
+                            key: torch.as_tensor(value, dtype=torch.bool) if not isinstance(value, torch.Tensor) else value.to(dtype=torch.bool)
+                            for key, value in image_masks.items()
+                        }
+                all_observations.append(sample_obs)
 
                 # Rewards from cached array (avoids per-sample image loading)
                 all_rewards.append(float(self._reward_array[sample_idx]))
@@ -241,29 +280,37 @@ class EpisodeAwareDataset:
                 obs_batch[key] = {}
                 for subkey in values[0]:
                     subvalues = [v[subkey] for v in values]
-                    if isinstance(subvalues[0], np.ndarray):
-                        subvalues = np.stack(subvalues)
-                        obs_batch[key][subkey] = torch.tensor(subvalues)
+                    if isinstance(subvalues[0], torch.Tensor):
+                        stacked = torch.stack(
+                            [v.to(dtype=torch.bool) if key.endswith("_mask") else v for v in subvalues],
+                            dim=0,
+                        )
+                        if key.endswith("_mask") and stacked.ndim > 1 and stacked.shape[-1] == 1:
+                            stacked = stacked.squeeze(-1)
+                        obs_batch[key][subkey] = stacked
+                    elif isinstance(subvalues[0], np.ndarray):
+                        stacked = np.stack(subvalues)
+                        if key.endswith("_mask"):
+                            if stacked.ndim > 1 and stacked.shape[-1] == 1:
+                                stacked = np.squeeze(stacked, axis=-1)
+                            stacked = stacked.astype(bool)
+                        obs_batch[key][subkey] = stacked
                     else:
-                        tmp_np = np.stack(subvalues)
-                        obs_batch[key][subkey] = torch.tensor(tmp_np)
+                        obs_batch[key][subkey] = np.asarray(subvalues)
             elif isinstance(values[0], str):
                 obs_batch[key] = values
-            elif isinstance(values[0], np.ndarray):
-                values = np.stack(values)
-                obs_batch[key] = torch.tensor(values)
             else:
-                obs_batch[key] = torch.tensor(np.stack(values))
+                values = [_to_numpy_array(v) for v in values]
+                if all(isinstance(v, np.ndarray) for v in values):
+                    obs_batch[key] = np.stack(values)
+                else:
+                    obs_batch[key] = np.asarray(values)
 
         # Stack actions
         action_list = []
         for obs in all_observations:
             a = obs["actions"]
-            if isinstance(a, np.ndarray):
-                a = a
-            else:
-                a = np.array(a)
-            action_list.append(a)
+            action_list.append(_to_numpy_array(a))
         action_batch = np.stack(action_list)
 
         reward_batch = np.array(all_rewards, dtype=np.float32)
