@@ -55,6 +55,33 @@ class CheckpointWeightLoader(WeightLoader):
 
 
 @dataclasses.dataclass(frozen=True)
+class CompatibleCheckpointWeightLoader(WeightLoader):
+    """Loads checkpoint leaves whose names and shapes match the target model.
+
+    This is useful when extending a pretrained model with new modules or changing
+    the action dimension. Incompatible or missing leaves keep their initialized
+    values instead of aborting model initialization.
+    """
+
+    params_path: str
+
+    def load(self, params: at.Params) -> at.Params:
+        loaded_params = _model.restore_params(download.maybe_download(self.params_path), restore_type=np.ndarray)
+        flat_ref = flax.traverse_util.flatten_dict(params)
+        flat_loaded = flax.traverse_util.flatten_dict(loaded_params)
+
+        result = {}
+        for key, value in flat_ref.items():
+            loaded_value = flat_loaded.get(key)
+            if loaded_value is not None and getattr(loaded_value, "shape", None) == value.shape:
+                result[key] = loaded_value.astype(value.dtype) if loaded_value.dtype != value.dtype else loaded_value
+            else:
+                result[key] = value
+
+        return flax.traverse_util.unflatten_dict(result)
+
+
+@dataclasses.dataclass(frozen=True)
 class PaliGemmaWeightLoader(WeightLoader):
     """Loads weights from the official PaliGemma checkpoint.
 

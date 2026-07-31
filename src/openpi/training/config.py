@@ -17,7 +17,6 @@ import openpi.models.model as _model
 import openpi.models.pi0_config as pi0_config
 import openpi.models.pi0_fast as pi0_fast
 import openpi.models.tokenizer as _tokenizer
-from openpi.models.pi0_config import PhysicsAwareConfig  # ← 新增
 
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
@@ -387,6 +386,14 @@ class SRBDataConfig(DataConfigFactory):
     observation_keys: Sequence[str] = ("proprio",)
     image_keys: Sequence[str] = ("image_base", "image_wrist")
     strict_state_dim: bool = False
+    physics_keys: Sequence[str] = (
+        "gravity",
+        "friction_coeff",
+        "robot_mass",
+        "air_density",
+        "terrain_roughness",
+    )
+    physics_defaults: Sequence[float] = (9.81, 0.5, 5.0, 1.225, 0.3)
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default_factory=_transforms.Group)
 
     @override
@@ -399,6 +406,8 @@ class SRBDataConfig(DataConfigFactory):
                     observation_keys = self.observation_keys,
                     image_keys = self.image_keys,
                     strict_state_dim = self.strict_state_dim,
+                    physics_keys = self.physics_keys,
+                    physics_defaults = self.physics_defaults,
                 )
             ],
             outputs=[srb_policy.SRBOutputs(action_dim=self.action_dim)],
@@ -1162,7 +1171,10 @@ _CONFIGS = [
                             "action": "action",
                             "reward": "reward",
                             "prompt": "prompt",
-                        })]),
+                        }
+                    )
+                ]
+            ),
         ),
         pytorch_weight_path="./checkpoints/gemma4_lora",
         # weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
@@ -1211,6 +1223,72 @@ _CONFIGS = [
         freeze_filter=pi0_config.Pi0Config(pi05=True, action_horizon=16, discrete_state_input=False,
                     paligemma_variant="gemma_2b_lora", action_expert_variant="gemma_300m_lora",).get_freeze_filter(),
         # ema_decay=None,
+    ),
+    TrainConfig(
+        name="physics_aware_srb_train_tracking",
+        model=pi0_config.PhysicsAwareConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=19,
+            action_horizon=16,
+            physics_dim=5,
+            num_physics_tokens=4,
+            use_action_queries=True,
+        ),
+        data=SRBDataConfig(
+            repo_id="srb_tracking",
+            assets=AssetsConfig(
+                assets_dir="./assets/srb_train_tracking",
+                asset_id="srb_tracking",
+            ),
+            base_config=DataConfig(
+                prompt_from_task=True,
+                action_sequence_keys=("action",),
+            ),
+            action_dim=19,
+            observation_keys=("state",),
+            image_keys=("image_base",),
+            repack_transforms=_transforms.Group(
+                inputs=[
+                    _transforms.RepackTransform(
+                        {
+                            "state": "observation.state",
+                            "image_base": "observation.images.image_front",
+                            "action": "action",
+                            "reward": "reward",
+                            "prompt": "prompt",
+                        },
+                        optional={
+                            "physics_params": "physics_params",
+                            "gravity": "gravity",
+                            "friction_coeff": "friction_coeff",
+                            "robot_mass": "robot_mass",
+                            "air_density": "air_density",
+                            "terrain_roughness": "terrain_roughness",
+                        },
+                    )
+                ]
+            ),
+        ),
+        weight_loader=weight_loaders.CompatibleCheckpointWeightLoader(
+            "./checkpoints/srb_train_tracking/srb_sample/rl_grpo_offline_jax/20/params"
+        ),
+        num_train_steps=20,
+        batch_size=8,
+        exp_name="srb_physics_aware",
+        save_interval=100,
+        overwrite=True,
+        wandb_enabled=False,
+        freeze_filter=pi0_config.PhysicsAwareConfig(
+            paligemma_variant="gemma_2b_lora",
+            action_expert_variant="gemma_300m_lora",
+            action_dim=19,
+            action_horizon=16,
+            physics_dim=5,
+            num_physics_tokens=4,
+            use_action_queries=True,
+        ).get_freeze_filter(),
+        ema_decay=None,
     ),
     #
     # Single-step pi0.5 configs (no diffusion, direct action prediction).
@@ -1493,7 +1571,7 @@ _CONFIGS = [
     #
     TrainConfig(
         name="physics_aware_planetary",
-        model=PhysicsAwareConfig(
+        model=pi0_config.PhysicsAwareConfig(
             paligemma_variant="gemma_2b",
             action_expert_variant="gemma_300m",
             action_dim=7,
@@ -1516,7 +1594,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="physics_aware_planetary_lora",
-        model=PhysicsAwareConfig(
+        model=pi0_config.PhysicsAwareConfig(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             action_dim=7,
@@ -1536,7 +1614,7 @@ _CONFIGS = [
         ),
         num_train_steps=30_000,
         batch_size=32,
-        freeze_filter=PhysicsAwareConfig(
+        freeze_filter=pi0_config.PhysicsAwareConfig(
             paligemma_variant="gemma_2b_lora",
             action_expert_variant="gemma_300m_lora",
             action_dim=7,
@@ -1546,7 +1624,7 @@ _CONFIGS = [
     ),
     TrainConfig(
         name="debug_physics_aware",
-        model=PhysicsAwareConfig(
+        model=pi0_config.PhysicsAwareConfig(
             paligemma_variant="dummy",
             action_expert_variant="dummy",
             action_dim=7,

@@ -95,10 +95,13 @@ class RepackTransform(DataTransformFn):
     """
 
     structure: at.PyTree[str]
+    optional: Mapping[str, str] = dataclasses.field(default_factory=dict)
 
     def __call__(self, data: DataDict) -> DataDict:
         flat_item = flatten_dict(data)
-        return jax.tree.map(lambda k: flat_item[k], self.structure)
+        output = jax.tree.map(lambda k: flat_item[k], self.structure)
+        output.update({key: flat_item[path] for key, path in self.optional.items() if path in flat_item})
+        return output
 
 
 @dataclasses.dataclass(frozen=True)
@@ -142,7 +145,15 @@ class Normalize(DataTransformFn):
         assert stats.q01 is not None
         assert stats.q99 is not None
         q01, q99 = stats.q01[..., : x.shape[-1]], stats.q99[..., : x.shape[-1]]
-        return (x - q01) / (q99 - q01 + 1e-6) * 2.0 - 1.0
+        quantile_range = q99 - q01
+        quantile_normalized = (x - q01) / (quantile_range + 1e-6) * 2.0 - 1.0
+        std = stats.std[..., : x.shape[-1]]
+        zscore_normalized = np.where(
+            np.abs(std) > 1e-6,
+            (x - stats.mean[..., : x.shape[-1]]) / (std + 1e-6),
+            0.0,
+        )
+        return np.where(np.abs(quantile_range) > 1e-6, quantile_normalized, zscore_normalized)
 
 
 @dataclasses.dataclass(frozen=True)

@@ -10,6 +10,7 @@ Usage:
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 import dataclasses
 import functools
 import logging
@@ -18,13 +19,13 @@ import pathlib
 import platform
 import sys
 import time
-from collections.abc import Sequence
 from typing import Literal
-import etils.epath as epath
 
+import etils.epath as epath
 import jax
 import jax.numpy as jnp
 import numpy as np
+import tyro
 import wandb
 
 try:
@@ -42,14 +43,13 @@ import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
-
+import RLtune.data_loader_rl as _data_loader
 from RLtune.grpo_algo import compute_advantages
 from RLtune.grpo_algo import filter_by_accuracy
 from RLtune.train import init_logging
 from RLtune.train import init_train_state
 from RLtune.train import offline_rl_train_step
 
-import RLtune.data_loader_rl as _data_loader
 
 @dataclasses.dataclass(frozen=True)
 class OfflineJAXConfig:
@@ -447,7 +447,4 @@ def main(rl_config: OfflineJAXConfig):
 
 
 if __name__ == "__main__":
-    # import tyro
-
-    # tyro.cli(OfflineJAXConfig, default=main)
-    main(OfflineJAXConfig())
+    main(tyro.cli(OfflineJAXConfig))

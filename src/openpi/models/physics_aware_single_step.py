@@ -2,14 +2,14 @@
 
 在 Pi0SingleStep 基础上增加 Physics Encoder, 将连续物理参数
  (重力加速度、摩擦系数、质量等) 编码为 token, 通过 adaRMS
-conditioning 通道注入 action expert 的每一层. 
+ conditioning 通道注入 action expert 的每一层.
 
-架构: 
+架构:
   PaliGemma (Vision + LLM) → prefix KV cache
   Physics Encoder (MLP + CrossAttn) → physics tokens
   Action Expert (adaRMS-conditioned) → 单步动作预测
 
-推理: 1 次 forward pass, ~10x 快于 flow matching. 
+推理: 1 次 forward pass, ~10x 快于 flow matching.
 """
 
 import logging
@@ -34,13 +34,13 @@ logger = logging.getLogger("openpi")
 
 
 class PhysicsEncoder(nnx.Module):
-    """将连续物理参数编码为 token 序列. 
+    """将连续物理参数编码为 token 序列.
 
     输入: (B, physics_dim) — 如 [g, μ, mass, air_density, terrain_roughness]
     输出: (B, num_tokens, output_dim) — 可注入 action expert 的 token
 
     内部使用可学习 positional embedding + self-attention 让不同
-    physics token 之间交互 (例如重力和摩擦的耦合效应)  
+    physics token 之间交互 (例如重力和摩擦的耦合效应)
     """
 
     def __init__(
@@ -60,7 +60,7 @@ class PhysicsEncoder(nnx.Module):
         # 输入投影: 标量物理参数 → hidden space
         self.input_proj = nnx.Linear(physics_dim, hidden_dim, rngs=rngs)
 
-        # 可学习的 query tokens (类似 DETR object queries) 
+        # 可学习的 query tokens (类似 DETR object queries)
         self.query_embed = nnx.Param(
             jax.random.normal(rngs.params(), (num_tokens, hidden_dim))
         )
@@ -87,7 +87,7 @@ class PhysicsEncoder(nnx.Module):
         Returns:
             physics_tokens: (B, num_tokens, output_dim)
         """
-        B = physics_params.shape[0]
+        batch_size = physics_params.shape[0]
 
         # 投射到 hidden space
         x = nnx.swish(self.input_proj(physics_params))  # (B, hidden_dim)
@@ -95,24 +95,25 @@ class PhysicsEncoder(nnx.Module):
 
         # 拼接可学习 query tokens
         queries = jnp.broadcast_to(
-            self.query_embed.value[None, :, :], (B, self.num_tokens, self.hidden_dim)
+            self.query_embed.value[None, :, :], (batch_size, self.num_tokens, self.hidden_dim)
         )
         x = jnp.concatenate([x, queries], axis=1)  # (B, 1+num_tokens, hidden_dim)
 
         # Self-attention
-        for attn, norm in zip(self.attn_layers, self.norms):
-            x = x + attn(norm(x), norm(x), norm(x))
+        for attn, norm in zip(self.attn_layers, self.norms, strict=True):
+            normalized = norm(x)
+            x = x + attn(normalized, normalized, normalized, decode=False)
 
-        # 只取 query tokens 的输出 (丢弃第一个 input token) 
+        # 只取 query tokens 的输出 (丢弃第一个 input token)
         x = x[:, 1:, :]  # (B, num_tokens, hidden_dim)
 
         return self.output_proj(x)  # (B, num_tokens, output_dim)
 
 
 class PhysicsAwareSingleStep(_model.BaseModel):
-    """物理信息引导的单步动作预测模型. 
+    """物理信息引导的单步动作预测模型.
 
-    与 Pi0SingleStep 的区别: 
+    与 Pi0SingleStep 的区别:
     1. 新增 PhysicsEncoder: 将连续物理参数编码为 token
     2. physics_cond 通过 adaRMS conditioning 通道注入 action expert
     3. compute_loss / sample_actions 接收 physics_params 参数
@@ -156,12 +157,12 @@ class PhysicsAwareSingleStep(_model.BaseModel):
             rngs=rngs,
         )
 
-        # Physics conditioning 聚合投影 (→ adaRMS cond vector) 
-        self.physics_cond_proj = nnx.Sequential([
+        # Physics conditioning 聚合投影 (→ adaRMS cond vector)
+        self.physics_cond_proj = nnx.Sequential(
             nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs),
             nnx.swish,
             nnx.Linear(action_expert_config.width, action_expert_config.width, rngs=rngs),
-        ])
+        )
 
         # === Action projection ===
         self.action_in_proj = nnx.Linear(config.action_dim, action_expert_config.width, rngs=rngs)
@@ -216,7 +217,8 @@ class PhysicsAwareSingleStep(_model.BaseModel):
         if hasattr(self, "action_queries"):
             batch_size = obs.state.shape[0]
             action_tokens = jnp.broadcast_to(
-                self.action_queries.value, (batch_size, self.action_horizon, -1)
+                self.action_queries.value,
+                (batch_size, self.action_horizon, self.action_queries.value.shape[-1]),
             )
             action_tokens = self.action_query_proj(action_tokens)
         else:

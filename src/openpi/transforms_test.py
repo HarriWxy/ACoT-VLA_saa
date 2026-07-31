@@ -2,6 +2,7 @@ import numpy as np
 import pytest
 
 import openpi.models.tokenizer as _tokenizer
+import openpi.shared.normalize as _normalize
 import openpi.transforms as _transforms
 
 
@@ -14,6 +15,30 @@ def test_repack_transform():
     )
     item = {"b": {"c": 1}, "e": {"f": 2}}
     assert transform(item) == {"a": {"b": 1}, "d": 2}
+
+
+def test_repack_transform_optional_fields():
+    transform = _transforms.RepackTransform(
+        structure={"state": "state"},
+        optional={"physics_params": "physics_params", "gravity": "gravity"},
+    )
+
+    assert transform({"state": 1, "gravity": 9.81}) == {"state": 1, "gravity": 9.81}
+    assert transform({"state": 1}) == {"state": 1}
+
+
+def test_quantile_normalization_falls_back_for_constant_stats():
+    stats = _normalize.NormStats(
+        mean=np.array([9.81]),
+        std=np.array([0.0]),
+        q01=np.array([9.81]),
+        q99=np.array([9.81]),
+    )
+    result = _transforms.Normalize({"physics_params": stats}, use_quantiles=True)(
+        {"physics_params": np.array([[9.81]], dtype=np.float32)}
+    )
+
+    assert np.allclose(result["physics_params"], 0.0)
 
 
 def test_delta_actions():

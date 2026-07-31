@@ -5,21 +5,23 @@ will compute the mean and standard deviation of the data in the dataset and save
 to the config assets directory.
 """
 
+import os
+import pathlib
+
 import numpy as np
 import tqdm
 import tyro
+
+os.environ["HF_DATASETS_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 
 import openpi.models.model as _model
 import openpi.shared.normalize as normalize
 import openpi.training.config as _config
 import openpi.training.data_loader as _data_loader
 import openpi.transforms as transforms
-
-import os
-os.environ["HF_DATASETS_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = "0.9"
 
 
 class RemoveStrings(transforms.DataTransformFn):
@@ -106,6 +108,8 @@ def main(config_name: str, max_frames: int | None = None):
         )
 
     keys = ["state", "actions"]
+    if config.model.model_type == _model.ModelType.PHYSICS_AWARE:
+        keys.append("physics_params")
     stats = {key: normalize.RunningStats() for key in keys}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
@@ -114,11 +118,12 @@ def main(config_name: str, max_frames: int | None = None):
 
     norm_stats = {key: stats.get_statistics() for key, stats in stats.items()}
 
-    output_path = config.assets_dirs / data_config.repo_id
+    assets_dir = config.data.assets.assets_dir or config.assets_dirs
+    asset_id = config.data.assets.asset_id or data_config.repo_id
+    output_path = pathlib.Path(assets_dir) / asset_id
     print(f"Writing stats to: {output_path}")
     normalize.save(output_path, norm_stats)
 
 
 if __name__ == "__main__":
-    # tyro.cli(main)
-    main(config_name="srb_train_gemma4")
+    tyro.cli(main)

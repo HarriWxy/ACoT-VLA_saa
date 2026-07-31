@@ -35,6 +35,27 @@ def test_srb_inputs_handles_missing_images():
     assert not result["image_mask"]["left_wrist_0_rgb"]
 
 
+def test_srb_inputs_physics_aware_defaults():
+    transform = srb_policy.SRBInputs(
+        action_dim=19,
+        model_type=_model.ModelType.PHYSICS_AWARE,
+        observation_keys=("state",),
+        image_keys=("image_base",),
+        physics_keys=("gravity", "friction_coeff"),
+        physics_defaults=(9.81, 0.5),
+    )
+
+    result = transform(
+        {
+            "state": np.zeros(8, dtype=np.float32),
+            "image_base": np.zeros((2, 2, 3), dtype=np.uint8),
+        }
+    )
+
+    assert np.allclose(result["physics_params"], [9.81, 0.5])
+    assert set(result["image"]) == {"base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"}
+
+
 def test_srb_outputs_slice_actions():
     transform = srb_policy.SRBOutputs(action_dim=7)
     actions = np.random.rand(10, 32).astype(np.float32)

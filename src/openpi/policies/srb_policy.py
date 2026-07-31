@@ -1,5 +1,5 @@
-import dataclasses
 from collections.abc import Sequence
+import dataclasses
 
 import einops
 import numpy as np
@@ -77,10 +77,12 @@ class SRBInputs(transforms.DataTransformFn):
     image_keys: Sequence[str] = ("image_base", "image_wrist")
     default_image_resolution: tuple[int, int] = _model.IMAGE_RESOLUTION
     strict_state_dim: bool = False
+    physics_keys: Sequence[str] = ()
+    physics_defaults: Sequence[float] = ()
 
     def __call__(self, data: dict) -> dict:
         state = _build_state(data, self.observation_keys)
-        
+
         if state.shape[-1] > 8:
             if self.strict_state_dim:
                 raise ValueError(
@@ -101,7 +103,7 @@ class SRBInputs(transforms.DataTransformFn):
             wrist_image = np.zeros_like(base_image)
 
         match self.model_type:
-            case _model.ModelType.PI0 | _model.ModelType.PI05:
+            case _model.ModelType.PI0 | _model.ModelType.PI05 | _model.ModelType.PHYSICS_AWARE:
                 names = ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb")
                 images = (base_image, wrist_image, np.zeros_like(base_image))
                 image_masks = (
@@ -137,6 +139,27 @@ class SRBInputs(transforms.DataTransformFn):
             if isinstance(prompt, bytes):
                 prompt = prompt.decode("utf-8")
             inputs["prompt"] = prompt
+
+        if self.model_type == _model.ModelType.PHYSICS_AWARE:
+            if len(self.physics_keys) != len(self.physics_defaults):
+                raise ValueError("physics_keys and physics_defaults must have the same length")
+
+            if "physics_params" in data:
+                physics_params = _flatten_vector(data["physics_params"])
+            else:
+                physics_params = np.asarray(
+                    [
+                        float(np.asarray(data.get(key, default)).reshape(-1)[0])
+                        for key, default in zip(self.physics_keys, self.physics_defaults, strict=True)
+                    ],
+                    dtype=np.float32,
+                )
+
+            if physics_params.size != len(self.physics_keys):
+                raise ValueError(
+                    f"Expected {len(self.physics_keys)} physics parameters, got {physics_params.size}"
+                )
+            inputs["physics_params"] = physics_params
 
         return inputs
 
