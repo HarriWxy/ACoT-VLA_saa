@@ -123,6 +123,7 @@ class EpisodeAwareDataset:
             self._episode_rewards: dict[int, float] = {}
             self._episode_length: dict[int, int] = {}
             self._episode_prompts: dict[int, str] = {}
+            self._episode_task_indices: dict[int, int] = {}
 
             # Try to get tasks from metadata
             task_names = None
@@ -135,8 +136,12 @@ class EpisodeAwareDataset:
                 self._episode_rewards[ep_idx] = self._aggregate_reward(ep_rewards.tolist())
 
                 # Cache prompt from task_index
-                if task_names is not None and "task_index" in hf.column_names:
+                task_idx = 0
+                if "task_index" in hf.column_names:
                     task_idx = int(hf[indices[0]]["task_index"])
+
+                self._episode_task_indices[ep_idx] = task_idx
+                if task_names is not None and "task_index" in hf.column_names:
                     if 0 <= task_idx < len(task_names):
                         self._episode_prompts[ep_idx] = task_names[task_idx]
                     else:
@@ -155,6 +160,7 @@ class EpisodeAwareDataset:
             self._episode_rewards = {idx: self._aggregate_reward([0.0]) for idx in range(num_frames)}
             self._episode_length = {idx: 1 for idx in range(num_frames)}
             self._episode_prompts = {idx: "" for idx in range(num_frames)}
+            self._episode_task_indices = {idx: 0 for idx in range(num_frames)}
             self._episode_indices = list(range(num_frames))
             self._reward_array = np.zeros(num_frames, dtype=np.float32)
 
@@ -233,15 +239,22 @@ class EpisodeAwareDataset:
     ) -> list[list[int]]:
         """Sample episode groups for GRPO training.
 
-        Returns a list of episode groups, each containing episode indices.
-        Episodes are sampled uniformly at random.
+        Returns a list of episode groups, each containing episode indices
+        from the same task. Tasks are sampled uniformly, then episodes are
+        sampled uniformly within the chosen task.
         """
         if rng is None:
             rng = np.random.default_rng()
 
+        episodes_by_task: dict[int, list[int]] = defaultdict(list)
+        for episode_index in self._episode_indices:
+            episodes_by_task[self._episode_task_indices[episode_index]].append(episode_index)
+
         groups = []
-        available = np.array(self._episode_indices)
+        task_indices = np.array(sorted(episodes_by_task))
         for _ in range(n_groups):
+            task_index = int(rng.choice(task_indices))
+            available = np.array(episodes_by_task[task_index])
             if len(available) >= n_samples_per_group:
                 chosen = rng.choice(available, size=n_samples_per_group, replace=False)
             else:

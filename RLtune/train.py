@@ -61,6 +61,7 @@ import openpi.training.weight_loaders as _weight_loaders
 
 from RLtune.env_runner import EnvRunner
 from RLtune.env_runner import compute_rollout_metrics
+from RLtune.grpo_algo import compute_advantage_weights
 from RLtune.grpo_algo import compute_advantages
 from RLtune.grpo_algo import filter_by_accuracy
 from RLtune.reward_manager import create_reward_manager
@@ -146,21 +147,22 @@ def init_train_state(
     mesh: jax.sharding.Mesh,
     *,
     resume: bool,
+    learning_rate: float = 5e-6,
+    grad_clip_norm: float = 1.0,
+    weight_decay: float = 1e-4,
 ) -> tuple[training_utils.TrainState, Any]:
     """Initialize training state from SFT config.
 
     This reuses the SFT model initialization but prepares for RL training.
     """
-    # Use a lower learning rate for RL fine-tuning
-    rl_lr = 5e-6
     tx = optax.chain(
-        optax.clip_by_global_norm(1.0),
+        optax.clip_by_global_norm(grad_clip_norm),
         optax.adamw(
-            learning_rate=rl_lr,
+            learning_rate=learning_rate,
             b1=0.9,
             b2=0.95,
             eps=1e-8,
-            weight_decay=1e-4,
+            weight_decay=weight_decay,
         ),
     )
 
@@ -218,16 +220,14 @@ def rl_train_step(
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
     advantages: jnp.ndarray,
+    *,
+    advantage_temperature: float = 1.0,
+    max_advantage_weight: float = 20.0,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
-    """RL training step using advantage-weighted flow matching loss.
+    """RL-style step using bounded advantage-weighted flow matching.
 
-    Unlike SFT where we minimize the standard flow matching loss uniformly,
-    here we weight each sample's loss by its GRPO advantage:
-        L_rl = mean(A_i * L_fm_i)
-
-    This encourages the model to:
-    - Better fit trajectories that led to success (positive advantage).
-    - Move away from trajectories that led to failure (negative advantage).
+    Offline demonstrations do not expose policy likelihood ratios, so this is
+    a stable advantage-weighted behavior-cloning surrogate rather than PPO.
 
     Args:
         config: Training configuration.
@@ -259,9 +259,12 @@ def rl_train_step(
         if per_sample_loss.ndim > 1:
             per_sample_loss = jnp.mean(per_sample_loss, axis=-1)
 
-        # Weight by advantages
-        clipped_adv = jnp.clip(adv, -3.0, 3.0)
-        rl_loss = jnp.mean(clipped_adv * per_sample_loss)
+        advantage_weights = compute_advantage_weights(
+            adv,
+            temperature=advantage_temperature,
+            max_weight=max_advantage_weight,
+        )
+        rl_loss = jnp.mean(jax.lax.stop_gradient(advantage_weights) * per_sample_loss)
 
         return rl_loss
 
@@ -291,7 +294,11 @@ def rl_train_step(
             ),
         )
 
-    # Compute metrics
+    advantage_weights = compute_advantage_weights(
+        advantages,
+        temperature=advantage_temperature,
+        max_weight=max_advantage_weight,
+    )
     kernel_params = nnx.state(
         model,
         nnx.All(
@@ -305,6 +312,8 @@ def rl_train_step(
         "grad_norm": optax.global_norm(grads),
         "param_norm": optax.global_norm(kernel_params),
         "mean_advantage": jnp.mean(advantages),
+        "mean_advantage_weight": jnp.mean(advantage_weights),
+        "max_advantage_weight": jnp.max(advantage_weights),
     }
     return new_state, info
 
@@ -396,6 +405,9 @@ def offline_rl_train_step(
     state: training_utils.TrainState,
     batch: tuple[_model.Observation, _model.Actions],
     advantages: jnp.ndarray,
+    *,
+    advantage_temperature: float = 1.0,
+    max_advantage_weight: float = 20.0,
 ) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
     """Offline RL training step using demonstration data weighted by GRPO advantages.
 
@@ -413,7 +425,15 @@ def offline_rl_train_step(
 
     For on-policy training, use rl_train_step instead.
     """
-    return rl_train_step(config, rng, state, batch, advantages)
+    return rl_train_step(
+        config,
+        rng,
+        state,
+        batch,
+        advantages,
+        advantage_temperature=advantage_temperature,
+        max_advantage_weight=max_advantage_weight,
+    )
 
 
 # ---------------------------------------------------------------------------

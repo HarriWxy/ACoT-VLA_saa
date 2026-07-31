@@ -474,6 +474,66 @@ cd /root/SpaceRobot/ACoT-VLA_saa
 
 ---
 
+## GRPO 路线
+
+我会把“离线加权模仿”和“真正的 on-policy GRPO”拆开说明，并给出按你是否能稳定跑 SRB 环境来选择的下一步路线。
+
+结论先说清楚：当前实现适合当作“离线、按相对回报重加权的行为克隆”基线；要升级成真正 GRPO，首要阻塞项不是再调权重，而是收集当前策略 rollout 并得到每个动作块的可计算 `log_prob`。
+
+
+
+**差别是什么**
+
+当前目标是：
+
+$$
+w_i=\frac{\exp(\mathrm{clip}(A_i/T))}{\operatorname{mean}_j\exp(\mathrm{clip}(A_j/T))},\qquad
+L=\operatorname{mean}_i[w_i L_{\mathrm{FM}}(o_i,a_i)]
+$$
+
+其中 $(o_i,a_i,R_i)$ 来自固定离线数据集。它的含义是：更认真模仿高回报 demo，弱化低回报 demo。负 advantage 只会降低样本权重，不会像 PPO 那样直接约束“把该动作概率压低”。
+
+标准 GRPO/PPO 则需要：
+
+$$
+\tau_i \sim \pi_{\theta_{\mathrm{old}}}(\cdot\mid x),\qquad
+r_i(\theta)=\exp(\log\pi_\theta(a_i\mid o_i)-\log\pi_{\theta_{\mathrm{old}}}(a_i\mid o_i))
+$$
+
+再优化：
+
+$$
+-\mathbb{E}\left[\min(r_iA_i,\operatorname{clip}(r_i,1-\epsilon,1+\epsilon)A_i)\right]
++ \beta\,\mathrm{KL}(\pi_\theta\|\pi_{\mathrm{ref}})
+$$
+
+GRPO 不一定需要 critic，但必须有：
+
+- 同一任务下、由冻结旧策略采出的多条 rollout；
+- 这些 rollout 的当前环境 reward；
+- 当前与旧策略对相同行动的 `log_prob`，用于 ratio 和 clip。
+
+当前 flow-matching 模型的 `compute_loss()` 是去噪 MSE，不是 `-log_prob`。因此不能把 `old_loss / new_loss` 当 PPO ratio；那只是启发式，不是标准 GRPO。
+
+**下一步建议**
+
+优先做一次在线 rollout smoke test，而不是直接写 PPO loss：
+
+1. 冻结当前策略为 `theta_old`，对每个 prompt 采样 $G=4$ 条随机 rollout。
+2. 保存每个决策点的 observation、完整 action chunk、执行后的 reward、prompt、seed，以及旧策略版本。
+3. 确认同一 prompt 的 4 条 rollout 有足够 reward 方差；否则 GRPO advantage 大多为零，先解决探索/奖励，而非优化器。
+4. 先用这些新 rollout 做当前的有界 advantage-weighted flow-matching 更新。这仍不是 PPO，但已从“静态 demo 重加权”升级为 on-policy-ish 的 policy improvement。
+
+要实现**真正 GRPO**，下一项核心工程是给 flow policy 增加可计算的 `log_prob(action_chunk | observation)`：
+
+- 较严格但昂贵：把 flow ODE 当 continuous normalizing flow，通过散度积分估计 action density。
+- 更实用：改为带可追踪随机转移的 diffusion/高斯 action policy，缓存每个采样步的旧 `log_prob`。
+- 完成后再接入 old-policy snapshot、ratio、PPO clip、reference KL，以及每轮若干个 update epoch。
+
+若暂时无法稳定跑 SRB 环境，应继续走离线路线，并把方法明确命名为 offline AWR / return-weighted behavior cloning；此时更值得做的是 episode 级 train/eval 切分、SFT 基线对比、奖励语义校验，以及加入少量未加权 BC anchor。
+
+---
+
 ## 快速检查清单
 
 - [ ] 数据集转为 LeRobot 格式

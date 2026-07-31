@@ -18,6 +18,7 @@ import pathlib
 import platform
 import sys
 import time
+from collections.abc import Sequence
 from typing import Literal
 import etils.epath as epath
 
@@ -50,8 +51,6 @@ from RLtune.train import offline_rl_train_step
 
 import RLtune.data_loader_rl as _data_loader
 
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Disable GPU usage for JAX offline RL training.
-
 @dataclasses.dataclass(frozen=True)
 class OfflineJAXConfig:
     """Minimal configuration for JAX offline RL training."""
@@ -61,6 +60,8 @@ class OfflineJAXConfig:
     clip_ratio_low: float = 0.2
     gamma: float = 1.0
     adv_estimator: Literal["grpo", "rloo", "reinforce_plus_plus"] = "grpo"
+    advantage_temperature: float = 1.0
+    max_advantage_weight: float = 20.0
 
     filter_by_accuracy: bool = False
     accuracy_lower_bound: float = 0.1
@@ -89,16 +90,18 @@ class OfflineJAXConfig:
     fsdp_devices: int | None = None
 
 
-def prepare_advantages(advantages: jnp.ndarray, *, batch_size: int) -> jnp.ndarray:
-    """Repeat or truncate advantages so they match a batch size."""
+def prepare_advantages(advantages: jnp.ndarray, *, frame_counts: Sequence[int]) -> jnp.ndarray:
+    """Expand one episode-level advantage for every sampled frame."""
     advantages = jnp.asarray(advantages, dtype=jnp.float32)
-    if advantages.size == 0:
-        return jnp.zeros((batch_size,), dtype=jnp.float32)
-    if advantages.size >= batch_size:
-        return advantages[:batch_size]
+    frame_counts = tuple(int(frame_count) for frame_count in frame_counts)
+    if advantages.size != len(frame_counts):
+        raise ValueError(
+            f"Got {advantages.size} episode advantages for {len(frame_counts)} sampled episode frame counts."
+        )
+    if any(frame_count <= 0 for frame_count in frame_counts):
+        raise ValueError("Every sampled episode must contribute at least one frame.")
 
-    repeats = (batch_size + advantages.size - 1) // advantages.size
-    return jnp.tile(advantages, repeats)[:batch_size]
+    return jnp.repeat(advantages, jnp.asarray(frame_counts, dtype=jnp.int32))
 
 
 def _to_jax_array(value):
@@ -193,6 +196,17 @@ def maybe_initialize_distributed() -> None:
         )
 
 
+def get_resume_start_epoch(checkpoint_manager, *, resuming: bool) -> int:
+    """Return the completed epoch represented by the latest checkpoint."""
+    if not resuming:
+        return 0
+
+    checkpoint_steps = checkpoint_manager.all_steps()
+    if not checkpoint_steps:
+        raise RuntimeError("Cannot resume because no completed checkpoint step was found.")
+    return int(max(checkpoint_steps))
+
+
 def main(rl_config: OfflineJAXConfig):
     """Main offline RL training loop."""
     init_logging()
@@ -262,15 +276,36 @@ def main(rl_config: OfflineJAXConfig):
         f"Offline dataset ready: {dataset.total_episodes} episodes, {dataset.total_frames} frames"
     )
 
-    train_state, train_state_sharding = init_train_state(base_config, init_rng, mesh, resume=resuming)
+    train_state, train_state_sharding = init_train_state(
+        base_config,
+        init_rng,
+        mesh,
+        resume=resuming,
+        learning_rate=rl_config.learning_rate,
+        grad_clip_norm=rl_config.grad_clip_norm,
+        weight_decay=rl_config.weight_decay,
+    )
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
+    start_epoch = get_resume_start_epoch(checkpoint_manager, resuming=resuming)
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
+        logging.info("Resuming from completed epoch %d.", start_epoch)
+
+    if start_epoch > rl_config.total_epochs:
+        raise ValueError(
+            f"Checkpoint epoch {start_epoch} exceeds configured total_epochs={rl_config.total_epochs}."
+        )
+    initial_train_step = int(jax.device_get(train_state.step))
 
     ptrain_step = jax.jit(
-        functools.partial(offline_rl_train_step, base_config),
+        functools.partial(
+            offline_rl_train_step,
+            base_config,
+            advantage_temperature=rl_config.advantage_temperature,
+            max_advantage_weight=rl_config.max_advantage_weight,
+        ),
         in_shardings=(replicated_sharding, train_state_sharding, batch_sharding, replicated_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
@@ -279,7 +314,8 @@ def main(rl_config: OfflineJAXConfig):
     np_rng = np.random.default_rng(rl_config.seed + jax.process_index())
     best_reward = -float("inf")
 
-    for epoch in range(rl_config.total_epochs):
+    last_saved_epoch = start_epoch
+    for epoch in range(start_epoch, rl_config.total_epochs):
         epoch_start = time.time()
         logging.info(f"\n{'=' * 60}")
         logging.info(f"Epoch {epoch + 1}/{rl_config.total_epochs}")
@@ -325,8 +361,18 @@ def main(rl_config: OfflineJAXConfig):
 
         step_infos = []
         local_batch_size = max(1, rl_config.batch_size // max(1, jax.process_count()))
-        target_group_size = max(1, min(len(group), max(1, local_batch_size // max(1, rl_config.frames_per_episode))))
-        step_group = group[:target_group_size]
+        step_group = group
+        frame_counts = [
+            min(rl_config.frames_per_episode, dataset.get_episode_length(episode_index))
+            for episode_index in step_group
+        ]
+        expected_batch_size = sum(frame_counts)
+        if expected_batch_size > local_batch_size:
+            raise ValueError(
+                "A complete GRPO group produces "
+                f"{expected_batch_size} local frames, which exceeds batch_size={local_batch_size}. "
+                "Increase batch_size or reduce n_samples/frames_per_episode instead of truncating the group."
+            )
 
         for step in range(rl_config.num_train_steps_per_epoch):
             obs_batch, actions_np, _ = dataset.sample_batch_from_episodes(
@@ -338,7 +384,11 @@ def main(rl_config: OfflineJAXConfig):
             obs_dict = jax.tree.map(_to_jax_array, obs_batch.to_dict())
             observation = _model.Observation.from_dict(obs_dict)
             actions = jnp.asarray(actions_np, dtype=jnp.float32)
-            adv_jax = prepare_advantages(jnp.asarray(advantages, dtype=jnp.float32), batch_size=actions.shape[0])
+            adv_jax = prepare_advantages(jnp.asarray(advantages, dtype=jnp.float32), frame_counts=frame_counts)
+            if adv_jax.shape[0] != actions.shape[0]:
+                raise RuntimeError(
+                    f"Advantage batch size {adv_jax.shape[0]} does not match action batch size {actions.shape[0]}."
+                )
             observation, actions = _prepare_batch_for_sharding(
                 observation, actions, mesh=mesh, batch_sharding=batch_sharding, data_sharding=batch_sharding
             )
@@ -354,7 +404,12 @@ def main(rl_config: OfflineJAXConfig):
                 reduced = jax.device_get(stacked)
                 logging.info(f"  Step {step}: {', '.join(f'{k}={v:.4f}' for k, v in reduced.items())}")
                 if writer is not None:
-                    global_step = epoch * rl_config.num_train_steps_per_epoch + step + 1
+                    global_step = (
+                        initial_train_step
+                        + (epoch - start_epoch) * rl_config.num_train_steps_per_epoch
+                        + step
+                        + 1
+                    )
                     for key, value in reduced.items():
                         try:
                             writer.add_scalar(f"train/{key}", float(value), global_step)
@@ -380,11 +435,13 @@ def main(rl_config: OfflineJAXConfig):
         if (epoch + 1) % rl_config.save_interval == 0 and jax.process_index() == 0:
             logging.info(f"Saving checkpoint at epoch {epoch + 1}...")
             _checkpoints.save_state(checkpoint_manager, train_state, data_loader, epoch + 1)
+            last_saved_epoch = epoch + 1
             # wandb.log({"epoch": epoch + 1, "best_reward": best_reward}, step=epoch + 1)
 
     if jax.process_index() == 0:
-        logging.info("Training complete. Saving final checkpoint...")
-        _checkpoints.save_state(checkpoint_manager, train_state, data_loader, rl_config.total_epochs)
+        if last_saved_epoch != rl_config.total_epochs:
+            logging.info("Training complete. Saving final checkpoint...")
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, rl_config.total_epochs)
         checkpoint_manager.wait_until_finished()
         # wandb.log({"best_reward": best_reward}, step=rl_config.total_epochs)
 

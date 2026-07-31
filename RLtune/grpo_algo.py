@@ -83,16 +83,20 @@ def compute_rloo_advantage(
     Returns:
         advantages: (batch_size,) array of RLOO advantages.
     """
+    del n_samples  # The observed group size is authoritative after filtering.
+
     advantages = np.zeros_like(rewards, dtype=np.float32)
     unique_prompts = np.unique(prompt_indices)
 
     for pid in unique_prompts:
         mask = prompt_indices == pid
         group_rewards = rewards[mask]
+        group_indices = np.flatnonzero(mask)
         group_sum = np.sum(group_rewards)
-        for i, r in enumerate(group_rewards):
-            baseline = (group_sum - r) / max(n_samples - 1, 1)
-            advantages[mask][i] = r - baseline
+        group_size = len(group_rewards)
+        for index, reward in zip(group_indices, group_rewards, strict=True):
+            baseline = (group_sum - reward) / max(group_size - 1, 1)
+            advantages[index] = reward - baseline
 
     return advantages
 
@@ -196,25 +200,38 @@ def filter_by_accuracy(
 # ---------------------------------------------------------------------------
 
 
+def compute_advantage_weights(
+    advantages: jnp.ndarray,
+    *,
+    temperature: float = 1.0,
+    max_weight: float = 20.0,
+) -> jnp.ndarray:
+    """Convert relative advantages into bounded, normalized BC weights."""
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if max_weight < 1:
+        raise ValueError("max_weight must be at least 1")
+
+    max_log_weight = float(np.log(max_weight))
+    log_weights = jnp.clip(advantages / temperature, -max_log_weight, max_log_weight)
+    weights = jnp.exp(log_weights)
+    return weights / jnp.mean(weights)
+
+
 def compute_weighted_flow_matching_loss(
     per_sample_loss: jnp.ndarray,
     advantages: jnp.ndarray,
     eos_mask: jnp.ndarray | None = None,
-) -> tuple[jnp.ndarray, dict[str, float]]:
-    """Compute advantage-weighted flow matching loss for GRPO.
+    *,
+    temperature: float = 1.0,
+    max_weight: float = 20.0,
+) -> tuple[jnp.ndarray, dict[str, jnp.ndarray]]:
+    """Compute a bounded advantage-weighted flow matching surrogate.
 
-    Instead of PPO's log-prob ratio clipping (which requires explicit log-probs),
-    we directly weight the flow matching MSE loss by the advantage:
-
-        L_rl = mean(A_i * L_fm_i)
-
-    This encourages the model to:
-    - Reduce loss on trajectories with positive advantage (successful).
-    - Increase loss on trajectories with negative advantage (failed) — but bounded
-      by the fact that MSE is always non-negative.
-
-    For more stable training, we use a clipped weighting:
-        L_rl = mean(clip(A_i, -clip_range, clip_range) * L_fm_i)
+    Offline demonstrations do not provide the old-policy likelihood ratio
+    required by PPO/GRPO. We therefore use non-negative, normalized weights so
+    negative advantages reduce a demonstration's influence rather than making
+    the non-negative flow-matching loss unbounded below.
 
     Args:
         per_sample_loss: (batch_size,) per-sample flow matching loss.
@@ -225,20 +242,17 @@ def compute_weighted_flow_matching_loss(
         loss: Scalar RL loss.
         metrics: Dictionary of training metrics.
     """
-    # Clip advantages for stability
-    clipped_advantages = jnp.clip(advantages, -3.0, 3.0)
+    del eos_mask
+    weights = compute_advantage_weights(advantages, temperature=temperature, max_weight=max_weight)
+    weighted_loss = jnp.mean(jax.lax.stop_gradient(weights) * per_sample_loss)
 
-    # Weight the loss by advantages
-    # Positive advantage → reduce loss (good trajectory)
-    # Negative advantage → increase loss (bad trajectory, encourage different behavior)
-    weighted_loss = jnp.mean(clipped_advantages * per_sample_loss)
-
-    # Metrics
     metrics = {
-        "rl_loss": float(weighted_loss),
-        "mean_advantage": float(jnp.mean(advantages)),
-        "mean_per_sample_loss": float(jnp.mean(per_sample_loss)),
-        "positive_advantage_ratio": float(jnp.mean((advantages > 0).astype(jnp.float32))),
+        "rl_loss": weighted_loss,
+        "mean_advantage": jnp.mean(advantages),
+        "mean_advantage_weight": jnp.mean(weights),
+        "max_advantage_weight": jnp.max(weights),
+        "mean_per_sample_loss": jnp.mean(per_sample_loss),
+        "positive_advantage_ratio": jnp.mean((advantages > 0).astype(jnp.float32)),
     }
 
     return weighted_loss, metrics
