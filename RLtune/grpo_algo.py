@@ -1,16 +1,16 @@
 """GRPO algorithm implementation for ACoT-VLA flow-matching models.
 
-Adapted from SimpleVLA-RL's core_algos.py for JAX/Flax continuous action spaces.
+Adapted from SimpleVLA-RL's core_algos.py for continuous action spaces.
 
 Key difference from SimpleVLA-RL:
 - SimpleVLA-RL uses token-level log-prob ratios (PPO clipping) because OpenVLA is autoregressive.
-- ACoT-VLA uses flow matching (continuous ODE), so we weight the denoising loss by advantages.
-- The "policy gradient" signal comes from scaling the MSE flow-matching loss by the advantage.
+- ACoT-VLA uses flow matching (continuous ODE), so we weight the denoising loss by relative advantages.
+- Offline data has no old-policy likelihood ratio, so the surrogate uses bounded positive weights.
 
 Mathematical formulation:
-  For flow matching, the standard loss is: L = E[||v_θ(x_t, t) - u_t||²]
-  With GRPO advantages, we weight this: L_rl = E[A_i · ||v_θ(x_t, t) - u_t||²]
-  Where A_i is the group-normalized advantage for trajectory i.
+    For flow matching, the standard loss is: L = E[||v_θ(x_t, t) - u_t||²]
+    Offline weighting uses: L_rl = E[w_i · ||v_θ(x_t, t) - u_t||²]
+    where w_i is a detached, positive, normalized function of the group advantage.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import torch
 
 # ---------------------------------------------------------------------------
 # Advantage estimation
@@ -216,6 +217,25 @@ def compute_advantage_weights(
     log_weights = jnp.clip(advantages / temperature, -max_log_weight, max_log_weight)
     weights = jnp.exp(log_weights)
     return weights / jnp.mean(weights)
+
+
+def compute_torch_advantage_weights(
+    advantages: torch.Tensor,
+    *,
+    temperature: float = 1.0,
+    max_weight: float = 20.0,
+) -> torch.Tensor:
+    """Convert relative advantages into bounded, normalized torch weights."""
+    if temperature <= 0:
+        raise ValueError("temperature must be positive")
+    if max_weight < 1:
+        raise ValueError("max_weight must be at least 1")
+
+    advantages = advantages.detach().to(dtype=torch.float32)
+    max_log_weight = float(np.log(max_weight))
+    log_weights = torch.clamp(advantages / temperature, -max_log_weight, max_log_weight)
+    weights = torch.exp(log_weights)
+    return weights / weights.mean()
 
 
 def compute_weighted_flow_matching_loss(

@@ -34,6 +34,7 @@ import platform
 import shutil
 import sys
 import time
+from collections.abc import Sequence
 from typing import Literal
 
 # Ensure project root is in sys.path
@@ -74,8 +75,6 @@ from RLtune.train_pytorch import set_seed
 from RLtune.train_pytorch import setup_ddp
 
 from openpi.models_pytorch.pi0_pytorch import PI0Pytorch
-
-os.environ["world_size"] = "1" # use 2 gpus for training
 
 # FSDP imports (available in PyTorch 2.0+)
 try:
@@ -256,6 +255,8 @@ class OfflineGRPOConfig:
 
     # ── Advantage estimation ──
     adv_estimator: Literal["grpo", "rloo", "reinforce_plus_plus"] = "grpo"
+    advantage_temperature: float = 1.0
+    max_advantage_weight: float = 20.0
 
     # ── Accuracy filtering ──
     filter_by_accuracy: bool = False  # True
@@ -291,6 +292,24 @@ class OfflineGRPOConfig:
 
     # ── Reproducibility ──
     seed: int = 42
+
+
+def prepare_frame_advantages(
+    advantages: np.ndarray,
+    *,
+    frame_counts: Sequence[int],
+) -> np.ndarray:
+    """Expand each episode advantage to the frames sampled from that episode."""
+    advantages = np.asarray(advantages, dtype=np.float32).reshape(-1)
+    frame_counts = tuple(int(frame_count) for frame_count in frame_counts)
+    if advantages.size != len(frame_counts):
+        raise ValueError(
+            f"Got {advantages.size} episode advantages for {len(frame_counts)} sampled episode frame counts."
+        )
+    if any(frame_count <= 0 for frame_count in frame_counts):
+        raise ValueError("Every sampled episode must contribute at least one frame.")
+
+    return np.repeat(advantages, frame_counts)
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +492,10 @@ def train_loop(rl_config: OfflineGRPOConfig):
             start_epoch, best_reward = load_rl_checkpoint(
                 model, optimizer, rl_ckpt_dir, device, projection_head=projection_head
             )
+        if start_epoch > rl_config.total_epochs:
+            raise ValueError(
+                f"Checkpoint epoch {start_epoch} exceeds configured total_epochs={rl_config.total_epochs}."
+            )
         for _ in range(start_epoch * rl_config.num_train_steps_per_epoch):
             scheduler.step()
         global_step = start_epoch * rl_config.num_train_steps_per_epoch
@@ -490,6 +513,7 @@ def train_loop(rl_config: OfflineGRPOConfig):
     if projection_head is not None:
         projection_head.train()
 
+    last_saved_epoch = start_epoch
     for epoch in range(start_epoch, rl_config.total_epochs):
         epoch_start = time.time()
 
@@ -507,7 +531,7 @@ def train_loop(rl_config: OfflineGRPOConfig):
         # group = groups
 
         # ── Phase 2: Compute episode rewards ──
-        rewards = np.array([dataset.get_episode_reward(ep) for ep in group], dtype=np.float16)
+        rewards = np.array([dataset.get_episode_reward(ep) for ep in group], dtype=np.float32)
         prompt_indices = np.zeros(len(group), dtype=np.int16)  # All same task
 
         if is_main:
@@ -550,6 +574,12 @@ def train_loop(rl_config: OfflineGRPOConfig):
         if is_main:
             logging.info(f"Advantages: mean={advantages.mean():.4f}, std={advantages.std():.4f}")
 
+        frame_counts = [
+            min(rl_config.frames_per_episode, dataset.get_episode_length(episode_index))
+            for episode_index in group
+        ]
+        adv_per_frame = prepare_frame_advantages(advantages, frame_counts=frame_counts)
+
         # ── Phase 5: Policy update ──
         step_losses = []
         pbar = (
@@ -573,12 +603,11 @@ def train_loop(rl_config: OfflineGRPOConfig):
             observation = jax_tree_to_device(obs_batch, device)
             actions = torch.from_numpy(actions_np).float().to(device)
 
-            # Expand advantages to match frame-level batch
-            adv_per_frame = np.repeat(advantages, rl_config.frames_per_episode)
-            if len(adv_per_frame) < batch_size:
-                repeats = (batch_size // len(adv_per_frame)) + 1
-                adv_per_frame = np.tile(adv_per_frame, repeats)
-            adv_tensor = torch.from_numpy(adv_per_frame[:batch_size]).float().to(device)
+            if len(adv_per_frame) != batch_size:
+                raise RuntimeError(
+                    f"Advantage batch size {len(adv_per_frame)} does not match action batch size {batch_size}."
+                )
+            adv_tensor = torch.from_numpy(adv_per_frame).float().to(device)
 
             # Project actions to model space if needed
             model_actions = actions
@@ -591,7 +620,8 @@ def train_loop(rl_config: OfflineGRPOConfig):
                 observation,
                 model_actions,
                 adv_tensor,
-                clip_advantage=3.0,
+                advantage_temperature=rl_config.advantage_temperature,
+                max_advantage_weight=rl_config.max_advantage_weight,
             )
 
             # Backward
@@ -653,23 +683,6 @@ def train_loop(rl_config: OfflineGRPOConfig):
                     writer.add_scalar(f"epoch/{key}", value, epoch)
             logging.info(f"Epoch {epoch + 1} summary: {all_metrics}")
 
-        # ── Save checkpoint ──
-        if (epoch + 1) % rl_config.save_interval == 0:
-            if is_main:
-                logging.info(f"Saving checkpoint at epoch {epoch + 1}...")
-            if use_ddp and _HAS_FSDP:
-                save_fsdp_checkpoint(
-                    model, optimizer, epoch + 1, global_step,
-                    rl_config, base_config, best_reward, is_main,
-                    projection_head=projection_head,
-                )
-            else:
-                save_rl_checkpoint(
-                    model, optimizer, epoch + 1, global_step,
-                    rl_config, base_config, best_reward, is_main,
-                    projection_head=projection_head,
-                )
-
         # Track best model by mean episode reward
         mean_ep_reward = float(np.mean(rewards))
         if mean_ep_reward > best_reward:
@@ -689,21 +702,41 @@ def train_loop(rl_config: OfflineGRPOConfig):
                 if projection_head is not None:
                     save_projection_head(projection_head, best_dir / "projection_head.safetensors")
 
+        # ── Save checkpoint ──
+        if (epoch + 1) % rl_config.save_interval == 0:
+            if is_main:
+                logging.info(f"Saving checkpoint at epoch {epoch + 1}...")
+            if use_ddp and _HAS_FSDP:
+                save_fsdp_checkpoint(
+                    model, optimizer, epoch + 1, global_step,
+                    rl_config, base_config, best_reward, is_main,
+                    projection_head=projection_head,
+                )
+            else:
+                save_rl_checkpoint(
+                    model, optimizer, epoch + 1, global_step,
+                    rl_config, base_config, best_reward, is_main,
+                    projection_head=projection_head,
+                )
+            last_saved_epoch = epoch + 1
+
     # Final save
-    if is_main:
+    if last_saved_epoch != rl_config.total_epochs and is_main:
         logging.info("Training complete. Saving final checkpoint...")
-    if use_ddp and _HAS_FSDP:
-        save_fsdp_checkpoint(
-            model, optimizer, rl_config.total_epochs, global_step,
-            rl_config, base_config, best_reward, is_main,
-            projection_head=projection_head,
-        )
-    else:
-        save_rl_checkpoint(
-            model, optimizer, rl_config.total_epochs, global_step,
-            rl_config, base_config, best_reward, is_main,
-            projection_head=projection_head,
-        )
+    if last_saved_epoch != rl_config.total_epochs:
+        if use_ddp and _HAS_FSDP:
+            save_fsdp_checkpoint(
+                model, optimizer, rl_config.total_epochs, global_step,
+                rl_config, base_config, best_reward, is_main,
+                projection_head=projection_head,
+            )
+        else:
+            save_rl_checkpoint(
+                model, optimizer, rl_config.total_epochs, global_step,
+                rl_config, base_config, best_reward, is_main,
+                data_config=data_config,
+                projection_head=projection_head,
+            )
 
     if is_main:
         writer.add_scalar("best_reward", best_reward, global_step)

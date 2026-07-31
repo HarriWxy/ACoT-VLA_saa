@@ -69,6 +69,7 @@ from RLtune.env_runner import EnvRunner
 from RLtune.env_runner import compute_rollout_metrics
 from RLtune.grpo_algo import compute_advantages
 from RLtune.grpo_algo import filter_by_accuracy
+from RLtune.grpo_algo import compute_torch_advantage_weights
 from RLtune.reward_manager import create_reward_manager
 from RLtune.rl_config import GRPOConfig
 
@@ -406,19 +407,22 @@ def compute_rl_loss(
     actions: torch.Tensor,
     advantages: torch.Tensor,
     coarse_actions: torch.Tensor | None = None,
-    clip_advantage: float = 3.0,
+    clip_advantage: float | None = None,
+    advantage_temperature: float = 1.0,
+    max_advantage_weight: float = 20.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Compute advantage-weighted flow matching loss for RL fine-tuning.
 
     The standard flow matching loss is:
         L_fm = ||v_θ(x_t, t) - u_t||²
 
-    With GRPO advantages, we weight each sample's loss:
-        L_rl = mean(A_i * L_fm_i)
+    Offline data does not provide the policy likelihood ratio needed by PPO.
+    We therefore convert relative advantages to detached, positive weights:
+        w_i = exp(clip(A_i / temperature)) / mean(exp(clip(A / temperature)))
+        L_rl = mean(w_i * L_fm_i)
 
-    This encourages the model to:
-    - Better fit trajectories that led to success (positive advantage).
-    - Move away from trajectories that led to failure (negative advantage).
+    This increases the influence of better trajectories while keeping the
+    non-negative flow-matching objective bounded below.
 
     Args:
         model: The model (PI0Pytorch or ACOT_VLAPytorch).
@@ -427,12 +431,30 @@ def compute_rl_loss(
         advantages: Per-sample advantages [B].
         coarse_actions: Coarse target actions [B, coarse_action_horizon, action_dim].
             Required for ACoT-VLA with explicit action reasoner.
-        clip_advantage: Clipping range for advantages.
+        clip_advantage: Optional legacy clipping range for advantages.
+        advantage_temperature: Temperature used to convert advantages to weights.
+        max_advantage_weight: Maximum unnormalized exponential weight.
 
     Returns:
         loss: Scalar RL loss.
         metrics: Dictionary of training metrics.
     """
+    advantages = advantages.reshape(-1)
+    if actions.shape[0] != advantages.numel():
+        raise ValueError(
+            f"Expected one advantage per action sample, got {advantages.numel()} advantages "
+            f"for batch size {actions.shape[0]}."
+        )
+    if clip_advantage is not None:
+        advantages_for_weighting = advantages.clamp(-clip_advantage, clip_advantage)
+    else:
+        advantages_for_weighting = advantages
+    advantage_weights = compute_torch_advantage_weights(
+        advantages_for_weighting,
+        temperature=advantage_temperature,
+        max_weight=max_advantage_weight,
+    )
+
     # Check if this is an ACoT-VLA model
     from openpi.models_pytorch.acot_vla_pytorch import ACOT_VLAPytorch
 
@@ -454,22 +476,17 @@ def compute_rl_loss(
             )
             loss = loss + sc_scale * sc_loss
 
-        # For ACoT-VLA, we weight the loss by mean advantage
-        # (since we can't get per-sample loss without modifying the forward pass)
-        clipped_adv = advantages.clamp(-clip_advantage, clip_advantage)
-        mean_adv = clipped_adv.mean()
-
-        # Scale loss by advantage sign to encourage/discourage
-        if mean_adv > 0:
-            rl_loss = loss * mean_adv
-        else:
-            rl_loss = loss * (1.0 + mean_adv)  # Reduce loss when negative advantage
+        # The ACoT forward API currently returns one scalar for the whole batch,
+        # so only a positive batch-level scale is available here.
+        rl_loss = loss * advantage_weights.mean().detach()
 
         metrics = {
             "rl_loss": rl_loss.item(),
             "base_loss": loss.item(),
             "mean_advantage": advantages.mean().item(),
-            "std_advantage": advantages.std().item(),
+            "std_advantage": advantages.std(unbiased=False).item(),
+            "mean_advantage_weight": advantage_weights.mean().item(),
+            "max_advantage_weight": advantage_weights.max().item(),
             "positive_advantage_ratio": (advantages > 0).float().mean().item(),
         }
         if sc_scale > 0:
@@ -485,17 +502,15 @@ def compute_rl_loss(
         else:
             per_sample_loss = per_element_loss
 
-        # Clip advantages for stability
-        clipped_adv = advantages.clamp(-clip_advantage, clip_advantage)
-
-        # Weight loss by advantages
-        rl_loss = (clipped_adv * per_sample_loss).mean()
+        rl_loss = (advantage_weights * per_sample_loss).mean()
 
         metrics = {
             "rl_loss": rl_loss.item(),
             "mean_per_sample_loss": per_sample_loss.mean().item(),
             "mean_advantage": advantages.mean().item(),
-            "std_advantage": advantages.std().item(),
+            "std_advantage": advantages.std(unbiased=False).item(),
+            "mean_advantage_weight": advantage_weights.mean().item(),
+            "max_advantage_weight": advantage_weights.max().item(),
             "positive_advantage_ratio": (advantages > 0).float().mean().item(),
         }
 
@@ -940,7 +955,7 @@ def train_loop(rl_config: GRPOConfig):
             save_rl_checkpoint(
                 model, optimizer, epoch + 1, global_step,
                 rl_config, base_config, best_success_rate,
-                is_main, data_config, # 
+                is_main,
                 projection_head=projection_head,
             )
 
