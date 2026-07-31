@@ -235,6 +235,8 @@ class PhysicsAwareConfig(_model.BaseModelConfig):
 
     pi05: bool = True
     discrete_state_input: bool = None  # type: ignore
+    pytorch_compile_mode: str | None = None
+    gemma4_model_path: str | None = None
 
     def __post_init__(self):
         if self.max_token_len is None:

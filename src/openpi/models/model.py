@@ -249,7 +249,12 @@ class BaseModelConfig(abc.ABC):
 
     def load_pytorch(self, train_config, weight_path: str):
         logger.info(f"train_config: {train_config}")
-        model = pi0_pytorch.PI0Pytorch(config=train_config.model)
+        if train_config.model.model_type == ModelType.PHYSICS_AWARE:
+            from openpi.models_pytorch.physics_aware_single_step_pytorch import PhysicsAwareSingleStepPytorch
+
+            model = PhysicsAwareSingleStepPytorch(config=train_config.model)
+        else:
+            model = pi0_pytorch.PI0Pytorch(config=train_config.model)
 
         # ── 处理 LoRA 模型加载预训练权重的 key 映射 ──
         # LoRA 模型的 Linear 层被替换为 LoRALinear, 其 base_linear 权重 key 为:

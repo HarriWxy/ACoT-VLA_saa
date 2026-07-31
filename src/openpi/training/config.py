@@ -142,6 +142,18 @@ class ModelTransformFactory(GroupFactory):
                         _transforms.PadStatesAndActions(model_config.action_dim),
                     ],
                 )
+            case _model.ModelType.PHYSICS_AWARE:
+                return _transforms.Group(
+                    inputs=[
+                        _transforms.InjectDefaultPrompt(self.default_prompt),
+                        _transforms.ResizeImages(224, 224),
+                        _transforms.TokenizePrompt(
+                            _tokenizer.PaligemmaTokenizer(model_config.max_token_len),
+                            discrete_state_input=model_config.discrete_state_input,
+                        ),
+                        _transforms.PadStatesAndActions(model_config.action_dim),
+                    ],
+                )
             case _model.ModelType.PI0_FAST:
                 tokenizer_cls = (
                     _tokenizer.FASTTokenizer

@@ -57,6 +57,7 @@ import torch.nn.functional as F
 import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
+import openpi.models.model as _model
 import openpi.models.pi0_config
 import openpi.models_pytorch.pi0_pytorch
 import openpi.models_pytorch.acot_vla_pytorch
@@ -184,7 +185,16 @@ def build_model(config: _config.TrainConfig, device: torch.device) -> torch.nn.M
               hasattr(config.model, "coarse_action_horizon") or \
               hasattr(config.model, "adopt_implicit_action_reasoner")
 
-    if is_acot:
+    is_physics_aware = config.model.model_type == _model.ModelType.PHYSICS_AWARE
+
+    if is_physics_aware:
+        from openpi.models_pytorch.physics_aware_single_step_pytorch import PhysicsAwareSingleStepPytorch
+
+        model_cfg = config.model
+        object.__setattr__(model_cfg, "dtype", config.pytorch_training_precision)
+        model = PhysicsAwareSingleStepPytorch(model_cfg).to(device)
+        logging.info(f"Built physics-aware single-step model: {model_cfg}")
+    elif is_acot:
         # Build ACoT-VLA model
         from openpi.models_pytorch.acot_vla_pytorch import ACOTConfigPytorch, ACOT_VLAPytorch
 
