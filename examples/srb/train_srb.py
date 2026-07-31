@@ -3,7 +3,7 @@ import functools
 import logging
 import platform
 from typing import Any
-
+import os
 import etils.epath as epath
 import flax.nnx as nnx
 from flax.training import common_utils
@@ -27,6 +27,7 @@ import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 import openpi.training.weight_loaders as _weight_loaders
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # ← 新增，指定使用的 GPU 设备
 
 def init_logging():
     """Custom logging format for better readability."""
@@ -190,6 +191,62 @@ def train_step(
     }
     return new_state, info
 
+@at.typecheck
+def acot_train_step(
+    config: _config.TrainConfig,
+    rng: at.KeyArrayLike,
+    state: training_utils.TrainState,
+    batch: tuple[_model.Observation, _model.Actions, _model.CoarseActions],
+) -> tuple[training_utils.TrainState, dict[str, at.Array]]:
+    model = nnx.merge(state.model_def, state.params)
+    model.train()
+
+    @at.typecheck
+    def loss_fn(
+        model: _model.BaseModel, rng: at.KeyArrayLike, observation: _model.Observation, actions: _model.Actions,
+        coarse_actions: _model.CoarseActions
+    ):
+        return model.compute_loss(rng, observation, actions, coarse_actions, train=True)
+
+    train_rng = jax.random.fold_in(rng, state.step)
+    observation, actions, coarse_actions = batch
+
+    # Filter out frozen params.
+    diff_state = nnx.DiffState(0, config.trainable_filter)
+    loss, grads = nnx.value_and_grad(loss_fn, argnums=diff_state)(model, train_rng, observation, actions, coarse_actions)
+
+    params = state.params.filter(config.trainable_filter)
+    updates, new_opt_state = state.tx.update(grads, state.opt_state, params)
+    new_params = optax.apply_updates(params, updates)
+
+    # Update the model in place and return the new full state.
+    nnx.update(model, new_params)
+    new_params = nnx.state(model)
+
+    new_state = dataclasses.replace(state, step=state.step + 1, params=new_params, opt_state=new_opt_state)
+    if state.ema_decay is not None:
+        new_state = dataclasses.replace(
+            new_state,
+            ema_params=jax.tree.map(
+                lambda old, new: state.ema_decay * old + (1 - state.ema_decay) * new, state.ema_params, new_params
+            ),
+        )
+
+    # Filter out params that aren't kernels.
+    kernel_params = nnx.state(
+        model,
+        nnx.All(
+            nnx.Param,
+            nnx.Not(nnx_utils.PathRegex(".*/(bias|scale|pos_embedding|input_embedding)")),
+            lambda _, x: x.value.ndim > 1,
+        ),
+    )
+    info = {
+        "loss": loss,
+        "grad_norm": optax.global_norm(grads),
+        "param_norm": optax.global_norm(kernel_params),
+    }
+    return new_state, info
 
 def main(config: _config.TrainConfig):
     init_logging()
@@ -212,7 +269,7 @@ def main(config: _config.TrainConfig):
     checkpoint_manager, resuming = _checkpoints.initialize_checkpoint_dir(
         config.checkpoint_dir,
         keep_period=config.keep_period,
-        overwrite=config.overwrite,
+        overwrite=config.overwrite if not os.getenv("DEBUG_MODE", default=False) == "true" else True,
         resume=config.resume,
     )
     init_wandb(config, resuming=resuming, enabled=config.wandb_enabled)
@@ -240,6 +297,21 @@ def main(config: _config.TrainConfig):
     if resuming:
         train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
+    # if config.model.model_type == _model.ModelType.ACOT_VLA_PI05 or config.model.model_type == _model.ModelType.ACOT_VLA_PI0:
+    #     ptrain_step = jax.jit(
+    #         functools.partial(acot_train_step, config),
+    #         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+    #         out_shardings=(train_state_sharding, replicated_sharding),
+    #         donate_argnums=(1,),
+    #     )
+    # elif config.model.model_type == _model.ModelType.PHYSICS_AWARE:  # ← 新增
+    #     ptrain_step = jax.jit(
+    #         functools.partial(train_step, config),  # 复用标准 train_step
+    #         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
+    #         out_shardings=(train_state_sharding, replicated_sharding),
+    #         donate_argnums=(1,),
+    #     )
+    # else:
     ptrain_step = jax.jit(
         functools.partial(train_step, config),
         in_shardings=(replicated_sharding, train_state_sharding, data_sharding),
@@ -248,6 +320,10 @@ def main(config: _config.TrainConfig):
     )
 
     start_step = int(train_state.step)
+    print("\n--- Trainable Parameters ---")
+    model = nnx.merge(train_state.model_def, train_state.params)
+    trainable_state = nnx.state(model, config.trainable_filter)
+    logging.info(f"{training_utils.array_tree_to_info(trainable_state)}")
     pbar = tqdm.tqdm(
         range(start_step, config.num_train_steps),
         initial=start_step,
@@ -278,4 +354,4 @@ def main(config: _config.TrainConfig):
 
 if __name__ == "__main__":
     # main(_config.cli())
-    main(_config.get_config("srb_train"))
+    main(_config.get_config("srb_train_tracking"))

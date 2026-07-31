@@ -32,6 +32,7 @@ import platform
 import sys
 import time
 from typing import Any
+import etils.epath as epath
 
 # Ensure project root is in sys.path so 'RLtune' can be imported
 # regardless of whether we run as `python -m RLtune.train`
@@ -472,6 +473,7 @@ def main(rl_config: GRPOConfig):
 
     # Get base training config
     base_config = _config.get_config(rl_config.config_name)
+    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
     # Override checkpoint dir if specified
     if rl_config.checkpoint_dir:

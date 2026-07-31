@@ -62,6 +62,29 @@ def test_with_fake_dataset():
         assert actions.shape == (config.batch_size, config.model.action_horizon, config.model.action_dim)
 
 
+def test_episode_aware_loader_exposes_episode_methods():
+    config = _config.get_config("debug")
+
+    loader = _data_loader.create_data_loader(
+        config,
+        skip_norm_stats=True,
+        num_batches=2,
+        episode_aware=True,
+    )
+
+    assert hasattr(loader, "sample_episodes_for_grpo")
+    assert hasattr(loader, "sample_batch_from_episodes")
+
+    groups = loader.sample_episodes_for_grpo(n_groups=1, n_samples_per_group=2)
+    assert len(groups) == 1
+    assert len(groups[0]) == 2
+
+    obs_batch, action_batch, reward_batch = loader.sample_batch_from_episodes(groups[0], frames_per_episode=1)
+    assert obs_batch is not None
+    assert action_batch.shape[0] == 2
+    assert reward_batch.shape == (2,)
+
+
 def test_with_real_dataset():
     config = _config.get_config("pi0_aloha_sim")
     config = dataclasses.replace(config, batch_size=4)

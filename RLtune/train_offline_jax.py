@@ -19,11 +19,7 @@ import platform
 import sys
 import time
 from typing import Literal
-
-# Ensure project root is in sys.path.
-_PROJECT_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
-if _PROJECT_ROOT not in sys.path:
-    sys.path.insert(0, _PROJECT_ROOT)
+import etils.epath as epath
 
 import jax
 import jax.numpy as jnp
@@ -35,19 +31,24 @@ try:
 except ImportError:  # pragma: no cover - optional dependency fallback
     SummaryWriter = None
 
+# Ensure project root is in sys.path.
+_PROJECT_ROOT = str(pathlib.Path(__file__).resolve().parent.parent)
+if _PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, _PROJECT_ROOT)
+
 import openpi.models.model as _model
 import openpi.training.checkpoints as _checkpoints
 import openpi.training.config as _config
-import openpi.training.data_loader as _data_loader
 import openpi.training.sharding as sharding
 import openpi.training.utils as training_utils
 
-from RLtune.episode_dataset import EpisodeAwareDataset
 from RLtune.grpo_algo import compute_advantages
 from RLtune.grpo_algo import filter_by_accuracy
 from RLtune.train import init_logging
 from RLtune.train import init_train_state
 from RLtune.train import offline_rl_train_step
+
+import RLtune.data_loader_rl as _data_loader
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Disable GPU usage for JAX offline RL training.
 
@@ -192,19 +193,6 @@ def maybe_initialize_distributed() -> None:
         )
 
 
-def build_episode_dataset(base_config: _config.TrainConfig, rl_config: OfflineJAXConfig) -> EpisodeAwareDataset:
-    """Build the episode-aware dataset from the standard data pipeline."""
-    data_config = base_config.data.create(base_config.assets_dirs, base_config.model)
-    raw_dataset = _data_loader.create_torch_dataset(data_config, base_config.model.action_horizon, base_config.model)
-    transformed_dataset = _data_loader.transform_dataset(raw_dataset, data_config, skip_norm_stats=False)
-
-    return EpisodeAwareDataset(
-        transformed_dataset,
-        reward_aggregation=rl_config.reward_aggregation,
-        reward_threshold=rl_config.reward_threshold,
-    )
-
-
 def main(rl_config: OfflineJAXConfig):
     """Main offline RL training loop."""
     init_logging()
@@ -219,6 +207,8 @@ def main(rl_config: OfflineJAXConfig):
         jax.device_count(),
     )
     logging.info(f"Offline RL config: {dataclasses.asdict(rl_config)}")
+
+    jax.config.update("jax_compilation_cache_dir", str(epath.Path("~/.cache/jax").expanduser()))
 
     base_config = _config.get_config(rl_config.config_name)
     if rl_config.checkpoint_dir:
@@ -235,6 +225,7 @@ def main(rl_config: OfflineJAXConfig):
 
     num_fsdp_devices = rl_config.fsdp_devices or base_config.fsdp_devices
     mesh = sharding.make_mesh(num_fsdp_devices)
+    data_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.DATA_AXIS))
     batch_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec(sharding.BATCH_AXIS))
     replicated_sharding = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
@@ -255,23 +246,34 @@ def main(rl_config: OfflineJAXConfig):
 
     # init_wandb(rl_config, base_config, resuming=resuming, enabled=rl_config.wandb_enabled)
 
+    data_loader = _data_loader.create_data_loader(
+        base_config,
+        sharding=data_sharding,
+        shuffle=True,
+        episode_aware=True,
+        reward_aggregation=rl_config.reward_aggregation,
+        reward_threshold=rl_config.reward_threshold,
+    )
+    data_iter = iter(data_loader)
+    batch = next(data_iter)
+    logging.info(f"Initialized data loader:\n{training_utils.array_tree_to_info(batch)}")
+    dataset = data_loader.episode_dataset
+    logging.info(
+        f"Offline dataset ready: {dataset.total_episodes} episodes, {dataset.total_frames} frames"
+    )
+
     train_state, train_state_sharding = init_train_state(base_config, init_rng, mesh, resume=resuming)
     jax.block_until_ready(train_state)
     logging.info(f"Initialized train state:\n{training_utils.array_tree_to_info(train_state.params)}")
 
     if resuming:
-        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, None)
+        train_state = _checkpoints.restore_state(checkpoint_manager, train_state, data_loader)
 
     ptrain_step = jax.jit(
         functools.partial(offline_rl_train_step, base_config),
         in_shardings=(replicated_sharding, train_state_sharding, batch_sharding, replicated_sharding),
         out_shardings=(train_state_sharding, replicated_sharding),
         donate_argnums=(1,),
-    )
-
-    dataset = build_episode_dataset(base_config, rl_config)
-    logging.info(
-        f"Offline dataset ready: {dataset.total_episodes} episodes, {dataset.total_frames} frames"
     )
 
     np_rng = np.random.default_rng(rl_config.seed + jax.process_index())
@@ -375,15 +377,14 @@ def main(rl_config: OfflineJAXConfig):
             writer.add_scalar("epoch/advantage_std", float(np.std(advantages)), epoch + 1)
             writer.flush()
 
-        if (epoch + 1) % rl_config.save_interval == 0:
-            if jax.process_index() == 0:
-                logging.info(f"Saving checkpoint at epoch {epoch + 1}...")
-                _checkpoints.save_state(checkpoint_manager, train_state, None, epoch + 1)
-                # wandb.log({"epoch": epoch + 1, "best_reward": best_reward}, step=epoch + 1)
+        if (epoch + 1) % rl_config.save_interval == 0 and jax.process_index() == 0:
+            logging.info(f"Saving checkpoint at epoch {epoch + 1}...")
+            _checkpoints.save_state(checkpoint_manager, train_state, data_loader, epoch + 1)
+            # wandb.log({"epoch": epoch + 1, "best_reward": best_reward}, step=epoch + 1)
 
     if jax.process_index() == 0:
         logging.info("Training complete. Saving final checkpoint...")
-        _checkpoints.save_state(checkpoint_manager, train_state, None, rl_config.total_epochs)
+        _checkpoints.save_state(checkpoint_manager, train_state, data_loader, rl_config.total_epochs)
         checkpoint_manager.wait_until_finished()
         # wandb.log({"best_reward": best_reward}, step=rl_config.total_epochs)
 

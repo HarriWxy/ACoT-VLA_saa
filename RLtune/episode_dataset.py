@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 import logging
-from typing import Any, Literal, Sequence
+from typing import Any, Literal, Sequence, SupportsIndex
 
 import numpy as np
 import torch
@@ -54,6 +54,19 @@ def _normalize_image_layout(image: Any) -> Any:
             return np.moveaxis(image, 0, -1)
 
     return image
+
+
+def _to_torch_tensor(value: Any, *, dtype: torch.dtype | None = None) -> torch.Tensor:
+    """Convert array-like values to torch tensors safely, including read-only numpy arrays."""
+    if isinstance(value, torch.Tensor):
+        return value.to(dtype=dtype) if dtype is not None else value
+
+    if isinstance(value, np.ndarray):
+        if not value.flags.writeable:
+            value = value.copy()
+        return torch.as_tensor(value, dtype=dtype)
+
+    return torch.as_tensor(np.array(value, copy=True), dtype=dtype)
 
 
 class EpisodeAwareDataset:
@@ -91,52 +104,73 @@ class EpisodeAwareDataset:
         raw_ds = transformed_dataset._dataset
         while hasattr(raw_ds, "_dataset") and not hasattr(raw_ds, "hf_dataset"):
             raw_ds = raw_ds._dataset
-        hf = raw_ds.hf_dataset
 
-        logger.info("Building episode index from hf_dataset...")
-        ep_col = np.array(hf["episode_index"])
-        reward_col = np.array(hf["reward"]).flatten()
+        hf = None
+        if hasattr(raw_ds, "hf_dataset"):
+            hf = raw_ds.hf_dataset
 
-        # Build episode index: episode_index -> list of sample indices
-        self._episode_to_indices: dict[int, list[int]] = defaultdict(list) # initialize a dictionary to map episode indices to sample indices
-        for i, ep_idx in enumerate(ep_col):
-            self._episode_to_indices[int(ep_idx)].append(i)
+        if hf is not None and hasattr(hf, "column_names") and "episode_index" in hf.column_names and "reward" in hf.column_names:
+            logger.info("Building episode index from hf_dataset...")
+            ep_col = np.array(hf["episode_index"])
+            reward_col = np.array(hf["reward"]).flatten()
 
-        # Compute episode rewards and cache prompts
-        self._episode_rewards: dict[int, float] = {}
-        self._episode_length: dict[int, int] = {}
-        self._episode_prompts: dict[int, str] = {}
+            # Build episode index: episode_index -> list of sample indices
+            self._episode_to_indices: dict[int, list[int]] = defaultdict(list)  # initialize a dictionary to map episode indices to sample indices
+            for i, ep_idx in enumerate(ep_col):
+                self._episode_to_indices[int(ep_idx)].append(i)
 
-        # Try to get tasks from metadata
-        task_names = None
-        if hasattr(raw_ds, "meta") and hasattr(raw_ds.meta, "tasks"):
-            task_names = raw_ds.meta.tasks
+            # Compute episode rewards and cache prompts
+            self._episode_rewards: dict[int, float] = {}
+            self._episode_length: dict[int, int] = {}
+            self._episode_prompts: dict[int, str] = {}
 
-        for ep_idx, indices in self._episode_to_indices.items():
-            self._episode_length[ep_idx] = len(indices)
-            ep_rewards = reward_col[indices]
-            self._episode_rewards[ep_idx] = self._aggregate_reward(ep_rewards.tolist())
+            # Try to get tasks from metadata
+            task_names = None
+            if hasattr(raw_ds, "meta") and hasattr(raw_ds.meta, "tasks"):
+                task_names = raw_ds.meta.tasks
 
-            # Cache prompt from task_index
-            if task_names is not None and "task_index" in hf.column_names:
-                task_idx = int(hf[indices[0]]["task_index"])
-                if 0 <= task_idx < len(task_names):
-                    self._episode_prompts[ep_idx] = task_names[task_idx]
+            for ep_idx, indices in self._episode_to_indices.items():
+                self._episode_length[ep_idx] = len(indices)
+                ep_rewards = reward_col[indices]
+                self._episode_rewards[ep_idx] = self._aggregate_reward(ep_rewards.tolist())
+
+                # Cache prompt from task_index
+                if task_names is not None and "task_index" in hf.column_names:
+                    task_idx = int(hf[indices[0]]["task_index"])
+                    if 0 <= task_idx < len(task_names):
+                        self._episode_prompts[ep_idx] = task_names[task_idx]
+                    else:
+                        self._episode_prompts[ep_idx] = ""
                 else:
                     self._episode_prompts[ep_idx] = ""
-            else:
-                self._episode_prompts[ep_idx] = ""
 
-        self._episode_indices = sorted(self._episode_to_indices.keys())
+            self._episode_indices = sorted(self._episode_to_indices.keys())
 
-        # Cache rewards array for fast batch access in sample_batch_from_episodes
-        self._reward_array = reward_col
+            # Cache rewards array for fast batch access in sample_batch_from_episodes
+            self._reward_array = reward_col
+        else:
+            logger.info("No hf_dataset episode metadata found; falling back to one-episode-per-sample indexing.")
+            num_frames = len(self._transformed)
+            self._episode_to_indices = {idx: [idx] for idx in range(num_frames)}
+            self._episode_rewards = {idx: self._aggregate_reward([0.0]) for idx in range(num_frames)}
+            self._episode_length = {idx: 1 for idx in range(num_frames)}
+            self._episode_prompts = {idx: "" for idx in range(num_frames)}
+            self._episode_indices = list(range(num_frames))
+            self._reward_array = np.zeros(num_frames, dtype=np.float32)
 
         logger.info(
             f"EpisodeAwareDataset: {self.total_episodes} episodes, "
             f"{self.total_frames} frames, "
             f"reward_agg={reward_aggregation}"
         )
+
+    def __getitem__(self, index: SupportsIndex) -> dict[str, Any]:
+        """Return one transformed frame for standard data-loader batching."""
+        return self._transformed[index]
+
+    def __len__(self) -> int:
+        """Return the number of transformed frames available for batching."""
+        return len(self._transformed)
 
     def _aggregate_reward(self, rewards: list[float]) -> float:
         arr = np.array(rewards, dtype=np.float32)
@@ -260,8 +294,7 @@ class EpisodeAwareDataset:
                     image_masks = sample_obs.get("image_mask")
                     if isinstance(image_masks, dict):
                         sample_obs["image_mask"] = {
-                            key: torch.as_tensor(value, dtype=torch.bool) if not isinstance(value, torch.Tensor) else value.to(dtype=torch.bool)
-                            for key, value in image_masks.items()
+                            key: _to_torch_tensor(value, dtype=torch.bool) for key, value in image_masks.items()
                         }
                 all_observations.append(sample_obs)
 
@@ -280,7 +313,9 @@ class EpisodeAwareDataset:
                 obs_batch[key] = {}
                 for subkey in values[0]:
                     subvalues = [v[subkey] for v in values]
-                    if isinstance(subvalues[0], torch.Tensor):
+                    if all(v is None for v in subvalues):
+                        obs_batch[key][subkey] = None
+                    elif isinstance(subvalues[0], torch.Tensor):
                         stacked = torch.stack(
                             [v.to(dtype=torch.bool) if key.endswith("_mask") else v for v in subvalues],
                             dim=0,
@@ -300,11 +335,14 @@ class EpisodeAwareDataset:
             elif isinstance(values[0], str):
                 obs_batch[key] = values
             else:
-                values = [_to_numpy_array(v) for v in values]
-                if all(isinstance(v, np.ndarray) for v in values):
-                    obs_batch[key] = np.stack(values)
+                if all(v is None for v in values):
+                    obs_batch[key] = None
                 else:
-                    obs_batch[key] = np.asarray(values)
+                    values = [_to_numpy_array(v) for v in values]
+                    if all(isinstance(v, np.ndarray) for v in values):
+                        obs_batch[key] = np.stack(values)
+                    else:
+                        obs_batch[key] = np.asarray(values)
 
         # Stack actions
         action_list = []
