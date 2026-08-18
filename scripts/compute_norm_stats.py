@@ -108,8 +108,12 @@ def main(config_name: str, max_frames: int | None = None):
         )
 
     keys = ["state", "actions"]
-    if config.model.model_type == _model.ModelType.PHYSICS_AWARE:
-        keys.append("physics_params")
+    # NOTE: physics_params is intentionally excluded from normalization stats
+    # when physics_randomize is enabled. The randomized values are already in
+    # physically meaningful ranges (e.g., gravity in [7.81, 11.81]) and should
+    # be passed to the model unnormalized so it can learn magnitude-dependent
+    # conditioning. If your dataset has real physics columns, you may want to
+    # include "physics_params" here instead.
     stats = {key: normalize.RunningStats() for key in keys}
 
     for batch in tqdm.tqdm(data_loader, total=num_batches, desc="Computing stats"):
@@ -126,4 +130,5 @@ def main(config_name: str, max_frames: int | None = None):
 
 
 if __name__ == "__main__":
-    tyro.cli(main)
+    # tyro.cli(main)
+    main(config_name="physics_aware_srb_train_tracking")

@@ -268,7 +268,7 @@ def rl_train_step(
 
         return rl_loss
 
-    train_rng = jax.random.fold_in(rng, state.step)
+    train_rng = jax.random.fold_in(rng, state.step) #
     observation, actions = batch
 
     # Filter out frozen params

@@ -243,6 +243,10 @@ class BaseModelConfig(abc.ABC):
         graphdef, state = nnx.split(model)
         if remove_extra_params:
             params = ocp.transform_utils.intersect_trees(state.to_pure_dict(), params)
+        # orbax.checkpoint and ocp.transform_utils.intersect_trees convert all dict keys to strings,
+        # but Flax NNX (e.g. nnx.Sequential, Python lists) use integer keys. Convert numeric-string
+        # dict keys back to integers so they match the live model structure from nnx.eval_shape.
+        params = _convert_numeric_dict_keys(params)
         at.check_pytree_equality(expected=state.to_pure_dict(), got=params, check_shapes=True, check_dtypes=False)
         state.replace_by_pure_dict(params)
         return nnx.merge(graphdef, state)
@@ -343,6 +347,26 @@ class BaseModel(nnx.Module, abc.ABC):
 
     @abc.abstractmethod
     def sample_actions(self, rng: at.KeyArrayLike, observation: Observation, **kwargs) -> Actions: ...
+
+
+def _convert_numeric_dict_keys(d):
+    """Convert numeric-string dict keys to integers.
+
+    orbax.checkpoint and ocp.transform_utils.intersect_trees serialize all dict keys as strings,
+    but Flax NNX (e.g. nnx.Sequential, Python lists stored as dicts) use integer keys internally.
+    This converts string keys like '0', '1', '2' back to their integer equivalents so the restored
+    params match the live model's pytree structure.
+    """
+    if isinstance(d, dict):
+        return {_convert_single_key(k): _convert_numeric_dict_keys(v) for k, v in d.items()}
+    return d
+
+
+def _convert_single_key(k):
+    """Convert a single numeric-string key to int."""
+    if isinstance(k, str) and k.isdigit():
+        return int(k)
+    return k
 
 
 def restore_params(

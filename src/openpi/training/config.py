@@ -394,6 +394,10 @@ class SRBDataConfig(DataConfigFactory):
         "terrain_roughness",
     )
     physics_defaults: Sequence[float] = (9.81, 0.5, 5.0, 1.225, 0.3)
+    # When True, randomly sample physics params from [default ± range] during training.
+    physics_randomize: bool = False
+    # Half-range for each physics parameter. Must have same length as physics_keys.
+    physics_ranges: Sequence[float] = ()
     repack_transforms: tyro.conf.Suppress[_transforms.Group] = dataclasses.field(default_factory=_transforms.Group)
 
     @override
@@ -408,6 +412,8 @@ class SRBDataConfig(DataConfigFactory):
                     strict_state_dim = self.strict_state_dim,
                     physics_keys = self.physics_keys,
                     physics_defaults = self.physics_defaults,
+                    physics_randomize = self.physics_randomize,
+                    physics_ranges = self.physics_ranges,
                 )
             ],
             outputs=[srb_policy.SRBOutputs(action_dim=self.action_dim)],
@@ -1246,8 +1252,12 @@ _CONFIGS = [
                 action_sequence_keys=("action",),
             ),
             action_dim=19,
-            observation_keys=("state",),
+            observation_keys=("state","proprio",),
             image_keys=("image_base",),
+            physics_randomize=False,
+            physics_defaults=(1.62, 0.5, 10.0, 0.0, 0.2), # moon
+            # Half-ranges: gravity±2, friction±0.3, mass±2, air_density±0.5, roughness±0.2
+            physics_ranges=(2.0, 0.3, 2.0, 0.5, 0.2),
             repack_transforms=_transforms.Group(
                 inputs=[
                     _transforms.RepackTransform(

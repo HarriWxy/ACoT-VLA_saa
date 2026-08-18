@@ -50,6 +50,7 @@ from RLtune.train import init_logging
 from RLtune.train import init_train_state
 from RLtune.train import offline_rl_train_step
 
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Disable GPU usage for JAX offline RL training.
 
 @dataclasses.dataclass(frozen=True)
 class OfflineJAXConfig:
@@ -67,7 +68,7 @@ class OfflineJAXConfig:
     accuracy_lower_bound: float = 0.1
     accuracy_upper_bound: float = 0.9
 
-    total_epochs: int = 20
+    total_epochs: int = 80
     num_train_steps_per_epoch: int = 10
     learning_rate: float = 5e-6
     grad_clip_norm: float = 1.0
@@ -78,7 +79,7 @@ class OfflineJAXConfig:
     frames_per_episode: int = 2
     batch_size: int = 32
 
-    config_name: str = "srb_train_tracking"
+    config_name: str = "physics_aware_srb_train_tracking"
     checkpoint_dir: str | None = None
     action_horizon: int = 16
     action_dim: int = 19
@@ -88,6 +89,7 @@ class OfflineJAXConfig:
     wandb_enabled: bool = False
     tensorboard_enabled: bool = True
     fsdp_devices: int | None = None
+    debug_train_step: bool = False  # Set to True to disable JIT compilation for debugging purposes.
 
 
 def prepare_advantages(advantages: jnp.ndarray, *, frame_counts: Sequence[int]) -> jnp.ndarray:
@@ -299,17 +301,32 @@ def main(rl_config: OfflineJAXConfig):
         )
     initial_train_step = int(jax.device_get(train_state.step))
 
-    ptrain_step = jax.jit(
-        functools.partial(
+    debug_train_step = rl_config.debug_train_step or os.environ.get("RLTUNE_DEBUG_TRAIN_STEP", "").lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if debug_train_step:   
+        logging.info("Debug train-step mode enabled; using unjitted train step for stepping.")
+        ptrain_step = functools.partial(
             offline_rl_train_step,
             base_config,
             advantage_temperature=rl_config.advantage_temperature,
             max_advantage_weight=rl_config.max_advantage_weight,
-        ),
-        in_shardings=(replicated_sharding, train_state_sharding, batch_sharding, replicated_sharding),
-        out_shardings=(train_state_sharding, replicated_sharding),
-        donate_argnums=(1,),
-    )
+        )
+    else:
+        ptrain_step = jax.jit(
+            functools.partial(
+                offline_rl_train_step,
+                base_config,
+                advantage_temperature=rl_config.advantage_temperature,
+                max_advantage_weight=rl_config.max_advantage_weight,
+            ),
+            in_shardings=(replicated_sharding, train_state_sharding, batch_sharding, replicated_sharding),
+            out_shardings=(train_state_sharding, replicated_sharding),
+            donate_argnums=(1,),
+        )
 
     np_rng = np.random.default_rng(rl_config.seed + jax.process_index())
     best_reward = -float("inf")
@@ -447,4 +464,5 @@ def main(rl_config: OfflineJAXConfig):
 
 
 if __name__ == "__main__":
-    main(tyro.cli(OfflineJAXConfig))
+    # main(tyro.cli(OfflineJAXConfig))
+    main(OfflineJAXConfig())  # TODO: remove this line and uncomment the above line when tyro is fixed for dataclasses with frozen=True

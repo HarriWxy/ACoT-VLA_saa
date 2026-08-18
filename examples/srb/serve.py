@@ -6,17 +6,25 @@ import tyro
 
 from openpi_client import base_policy as _base_policy
 from openpi.policies import debug_policy as _debug_policy
-# from openpi.serving import websocket_policy_server
-from openpi.serving import websocket_policy_server_sample as wps_sample
+import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
+
+SAMPLE = True  # True=使用 websocket_policy_server_sample, False=使用 websocket_policy_server
+
+if SAMPLE:
+    from openpi.serving import websocket_policy_server_sample as wps_sample
+else:
+    from openpi.serving import websocket_policy_server as wps_sample
+
 
 
 @dataclasses.dataclass
 class Args:
     policy_mode: Literal["model", "random", "zero"] = "model"
-    config_name: str = "pi05_srb"
-    checkpoint_dir: str = ".cache/openpi/openpi-assets/checkpoints/pi05_base"
-    action_horizon: int = 16
-    action_dim: int = 37
+    config_name: str = "physics_aware_srb_train_tracking"
+    checkpoint_dir: str = "checkpoints/physics_aware_srb_train_tracking/srb_physics_aware/rl_grpo_offline_jax/80"
+    action_horizon: int = 8
+    action_dim: int = 19
     random_seed: int = 0
     random_action_scale: float = 0.25
     host: str = "0.0.0.0" # ""127.168.1.116
@@ -59,26 +67,34 @@ def _create_policy(args: Args) -> _base_policy.BasePolicy:
 def main(args: Args) -> None:
     policy = _create_policy(args)
 
-    config = wps_sample.ServerConfig(
-        policy=policy,
-        host=args.host,
-        port=args.port,
-        action_dim=args.action_dim,
-        exploration_mode=args.exploration_mode,
-        exploration_noise_std=args.exploration_noise_std,
-        ou_theta=args.ou_theta,
-        ou_sigma=args.ou_sigma,
-        initial_noise_scale=args.initial_noise_scale,
-        num_steps=args.num_steps,
-    )
+    if SAMPLE:
+        config = wps_sample.ServerConfig(
+            policy=policy,
+            host=args.host,
+            port=args.port,
+            action_dim=args.action_dim,
+            exploration_mode=args.exploration_mode,
+            exploration_noise_std=args.exploration_noise_std,
+            ou_theta=args.ou_theta,
+            ou_sigma=args.ou_sigma,
+            initial_noise_scale=args.initial_noise_scale,
+            num_steps=args.num_steps,
+        )
 
-    server = wps_sample.WebsocketPolicyServer(
-        policy=policy,
-        host=args.host,
-        port=args.port,
-        metadata=policy.metadata,
-        config=config,
-    )
+        server = wps_sample.WebsocketPolicyServer(
+            policy=policy,
+            host=args.host,
+            port=args.port,
+            metadata=policy.metadata,
+            config=config,
+        )
+    else:
+        server = wps_sample.WebsocketPolicyServer(
+            policy=policy,
+            host=args.host,
+            port=args.port,
+            metadata=policy.metadata,
+        )
     server.serve_forever()
 
 

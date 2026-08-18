@@ -1,11 +1,14 @@
 from collections.abc import Sequence
 import dataclasses
+import logging
 
 import einops
 import numpy as np
 
 from openpi import transforms
 from openpi.models import model as _model
+
+logger = logging.getLogger(__name__)
 
 
 def make_srb_example() -> dict:
@@ -79,17 +82,23 @@ class SRBInputs(transforms.DataTransformFn):
     strict_state_dim: bool = False
     physics_keys: Sequence[str] = ()
     physics_defaults: Sequence[float] = ()
+    # When True and data has no physics columns, sample random physics params
+    # from [physics_defaults[i] - physics_ranges[i], physics_defaults[i] + physics_ranges[i]].
+    physics_randomize: bool = False
+    # Half-range for each physics parameter. Must have same length as physics_keys.
+    # E.g., for gravity with default=9.81 and range=2.0, sampled from [7.81, 11.81].
+    physics_ranges: Sequence[float] = ()
 
     def __call__(self, data: dict) -> dict:
         state = _build_state(data, self.observation_keys)
 
-        if state.shape[-1] > 8:
-            if self.strict_state_dim:
-                raise ValueError(
-                    f"SRB state dim {state.shape[-1]} exceeds model action dim {self.action_dim}. "
-                    "Either reduce observation_keys or disable strict_state_dim."
-                )
-            state = state[: 8]
+        # if state.shape[-1] > 8:
+        #     if self.strict_state_dim:
+        #         raise ValueError(
+        #             f"SRB state dim {state.shape[-1]} exceeds model action dim {self.action_dim}. "
+        #             "Either reduce observation_keys or disable strict_state_dim."
+        #         )
+        #     state = state[: 8]
         # state = transforms.pad_to_dim(state, self.action_dim)
 
 
@@ -145,8 +154,15 @@ class SRBInputs(transforms.DataTransformFn):
                 raise ValueError("physics_keys and physics_defaults must have the same length")
 
             if "physics_params" in data:
+                # Data already has physics params — use them directly.
                 physics_params = _flatten_vector(data["physics_params"])
+            elif self.physics_randomize and len(self.physics_ranges) == len(self.physics_keys):
+                # Randomize: sample each param from [default - range, default + range].
+                lo = np.array(self.physics_defaults, dtype=np.float32) - np.array(self.physics_ranges, dtype=np.float32)
+                hi = np.array(self.physics_defaults, dtype=np.float32) + np.array(self.physics_ranges, dtype=np.float32)
+                physics_params = np.random.uniform(lo, hi).astype(np.float32)
             else:
+                # Fallback to fixed defaults.
                 physics_params = np.asarray(
                     [
                         float(np.asarray(data.get(key, default)).reshape(-1)[0])

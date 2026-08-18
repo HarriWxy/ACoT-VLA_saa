@@ -287,6 +287,49 @@ class PhysicsAwareSingleStep(_model.BaseModel):
         return jnp.mean(jnp.square(predicted_actions - actions), axis=-1)
 
     @override
+    def compute_loss_rl(
+        self,
+        rng: at.KeyArrayLike,
+        observation: _model.Observation,
+        actions: _model.Actions,
+        *,
+        train: bool = False,
+    ) -> at.Float[at.Array, "*b ah"]:
+        """单步 L2 回归 loss, physics-conditioned."""
+        preprocess_rng, _ = jax.random.split(rng)
+        observation = _model.preprocess_observation(preprocess_rng, observation, train=train)
+
+        # 1. Physics encoding → conditioning vector
+        physics_cond = self._encode_physics(observation.physics_params)
+
+        # 2. Prefix (vision + language)
+        prefix_tokens, prefix_mask, prefix_ar_mask = self.embed_prefix(observation)
+
+        # 3. Action suffix (learnable queries)
+        suffix_tokens, suffix_mask, suffix_ar_mask = self.embed_action_suffix(
+            observation, physics_cond
+        )
+
+        # 4. Build attention mask
+        input_mask = jnp.concatenate([prefix_mask, suffix_mask], axis=1)
+        ar_mask = jnp.concatenate([prefix_ar_mask, suffix_ar_mask], axis=0)
+        attn_mask = make_attn_mask(input_mask, ar_mask)
+        positions = jnp.cumsum(input_mask, axis=1) - 1
+
+        # 5. Forward through LLM (physics_cond via adaRMS)
+        (_, suffix_out), _ = self.PaliGemma.llm(
+            [prefix_tokens, suffix_tokens],
+            mask=attn_mask,
+            positions=positions,
+            adarms_cond=[None, physics_cond],  # ← 关键: physics conditioning
+        )
+
+        # 6. Predict actions & L2 loss
+        predicted_actions = self.action_out_proj(suffix_out[:, -self.action_horizon:])
+        return jnp.mean(jnp.square(predicted_actions - actions), axis=-1)
+
+
+    @override
     def sample_actions(
         self,
         rng: at.KeyArrayLike,
