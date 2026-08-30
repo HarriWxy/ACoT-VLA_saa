@@ -1,12 +1,16 @@
 import dataclasses
 import logging
+import os
 import pathlib
 from typing import Literal
 
+from openpi_client import base_policy as _base_policy
 import tyro
 
-from openpi_client import base_policy as _base_policy
 from openpi.policies import debug_policy as _debug_policy
+
+os.environ["OPENPI_DISABLE_COMPILE"] = "1"  # 禁用 torch.compile, 避免与调试器冲突
+
 # from openpi.serving import websocket_policy_server
 
 SAMPLE = True  # True=使用 websocket_policy_server_sample, False=使用 websocket_policy_server
@@ -16,8 +20,6 @@ if SAMPLE:
 else:
     from openpi.serving import websocket_policy_server as wps_sample
 
-import os
-os.environ["OPENPI_DISABLE_COMPILE"] = "1"  # 禁用 torch.compile, 避免与调试器冲突
 
 @dataclasses.dataclass
 class Args:
@@ -31,25 +33,25 @@ class Args:
     action_dim: int = 19
     random_seed: int = 0
     random_action_scale: float = 0.25
-    host: str = "0.0.0.0" # ""127.168.1.116
+    host: str = "0.0.0.0"  # ""127.168.1.116
     port: int = 8899
     default_prompt: str | None = None
-    
+
     # ── 探索噪声参数 ──
     # 噪声模式: none / output / initial / both
     exploration_mode: str = "none"
-    exploration_noise_std: float = 0.05   # 输出噪声标准差
-    ou_theta: float = 0.15                # OU 均值回归速度
-    ou_sigma: float = 0.3                 # OU 噪声强度
-    initial_noise_scale: float = 1.0      # 初始噪声缩放因子
-    num_steps: int | None = None          # 流匹配去噪步数, None=模型默认
+    exploration_noise_std: float = 0.05  # 输出噪声标准差
+    ou_theta: float = 0.15  # OU 均值回归速度
+    ou_sigma: float = 0.3  # OU 噪声强度
+    initial_noise_scale: float = 1.0  # 初始噪声缩放因子
+    num_steps: int | None = None  # 流匹配去噪步数, None=模型默认
 
     # ── ActionProjectionHead 配置 ──
     # 当 checkpoint 训练时 action_dim 与实际需要的 action_dim 不同时使用
     # 例如: checkpoint 训练时 action_dim=32, 但需要输出 37 维动作
-    use_action_proj_head: bool = True     # 是否启用 ActionProjectionHead
+    use_action_proj_head: bool = True  # 是否启用 ActionProjectionHead
     action_proj_head_path: str | None = None  # projection head 权重路径, None=不加载
-    model_action_dim: int = 32             # 模型内部 action_dim (checkpoint 训练时的维度)
+    model_action_dim: int = 32  # 模型内部 action_dim (checkpoint 训练时的维度)
 
 
 def _create_policy(args: Args) -> _base_policy.BasePolicy:
@@ -112,6 +114,7 @@ def _create_policy(args: Args) -> _base_policy.BasePolicy:
     # ── ActionProjectionHead: 处理 action_dim 不匹配 ──
     if args.use_action_proj_head and args.model_action_dim != args.action_dim:
         import torch
+
         from openpi.models_pytorch.action_proj_head import ActionProjectionHead
 
         logging.info(
@@ -160,6 +163,7 @@ def main(args: Args) -> None:
     # 显示 PyTorch 设备信息
     try:
         import torch
+
         if args.pytorch_device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         else:
@@ -185,6 +189,8 @@ def main(args: Args) -> None:
             ou_sigma=args.ou_sigma,
             initial_noise_scale=args.initial_noise_scale,
             num_steps=args.num_steps,
+            model_action_horizon=args.action_horizon,
+            model_action_dim=args.model_action_dim,
         )
 
         server = wps_sample.WebsocketPolicyServer(

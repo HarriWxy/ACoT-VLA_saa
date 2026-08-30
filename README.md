@@ -1061,3 +1061,5 @@ total_loss = flow_matching_loss + config.self_consistency_loss_scale * sc_loss
 ```
 
 
+应该研究物理模型还是应该研究策略生成
+研究策略生成有什么途径

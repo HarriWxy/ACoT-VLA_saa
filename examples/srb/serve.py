@@ -1,12 +1,13 @@
 import dataclasses
 import logging
+import os
 from typing import Literal
 
+from openpi_client import base_policy as _base_policy
 import tyro
 
-from openpi_client import base_policy as _base_policy
 from openpi.policies import debug_policy as _debug_policy
-import os
+
 os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
 SAMPLE = True  # True=使用 websocket_policy_server_sample, False=使用 websocket_policy_server
@@ -17,28 +18,27 @@ else:
     from openpi.serving import websocket_policy_server as wps_sample
 
 
-
 @dataclasses.dataclass
 class Args:
-    policy_mode: Literal["model", "random", "zero"] = "model"
+    policy_mode: Literal["model", "random", "zero"] = "random"
     config_name: str = "physics_aware_srb_train_tracking"
     checkpoint_dir: str = "checkpoints/physics_aware_srb_train_tracking/srb_physics_aware/rl_grpo_offline_jax/80"
     action_horizon: int = 8
     action_dim: int = 19
     random_seed: int = 0
     random_action_scale: float = 0.25
-    host: str = "0.0.0.0" # ""127.168.1.116
+    host: str = "0.0.0.0"  # ""127.168.1.116
     port: int = 8899
     default_prompt: str | None = None
-    
+
     # ── 探索噪声参数 ──
     # 噪声模式: none / output / initial / both
     exploration_mode: str = "none"
-    exploration_noise_std: float = 0.05   # 输出噪声标准差
-    ou_theta: float = 0.15                # OU 均值回归速度
-    ou_sigma: float = 0.3                 # OU 噪声强度
-    initial_noise_scale: float = 1.0      # 初始噪声缩放因子
-    num_steps: int | None = None          # 流匹配去噪步数, None=模型默认
+    exploration_noise_std: float = 0.05  # 输出噪声标准差
+    ou_theta: float = 0.15  # OU 均值回归速度
+    ou_sigma: float = 0.3  # OU 噪声强度
+    initial_noise_scale: float = 1.0  # 初始噪声缩放因子
+    num_steps: int | None = None  # 流匹配去噪步数, None=模型默认
 
 
 def _create_policy(args: Args) -> _base_policy.BasePolicy:
@@ -79,6 +79,8 @@ def main(args: Args) -> None:
             ou_sigma=args.ou_sigma,
             initial_noise_scale=args.initial_noise_scale,
             num_steps=args.num_steps,
+            model_action_horizon=args.action_horizon,
+            model_action_dim=args.action_dim,
         )
 
         server = wps_sample.WebsocketPolicyServer(
